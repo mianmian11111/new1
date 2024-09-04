@@ -1,0 +1,3 @@
+#! /bin/bash
+source /share/apps/oneapi2021/setvars.sh
+mpirun -bootstrap slurm /share/apps/lammps-3Mar20-intel/src/lmp_intel_cpu_intelmpi < /share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/submit.sh
