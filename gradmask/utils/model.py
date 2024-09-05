@@ -53,15 +53,16 @@ class BertForSequenceClassification(BertPreTrainedModel):
                             attention_mask=attention_mask, head_mask=head_mask, 
                             output_hidden_states=output_hidden_states,)
         pooled_output_1 = outputs[1]
-        hidden_states = outputs[2] # 元组13个tensor( 32, 59, 768)
+        hidden_states = outputs[2] # 元组13个tensor( 32, 59, 768)，batch，token，sequence_length
 
-        num_layers = len(hidden_states)
-        # hidden_layer = 12
-        
-        total_loss = 0
+        num_layers = len(hidden_states) # 13，1个嵌入层hidden_states[0]+12个隐藏层
+
+        # 将12个层的logits存入logits_list列表     
         logits_list = []
-        
+
+        # i从1到12，只取隐藏层，不取hidden_states[0]
         for i in range(1,num_layers):
+            # pooled_output取所有token的平均值
             pooled_output = torch.mean(hidden_states[i][:,1:,:],dim=1) 
             pooled_output = self.dropout(pooled_output)
             logits = self.classifier(pooled_output)
