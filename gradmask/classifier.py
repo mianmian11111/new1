@@ -91,17 +91,7 @@ class Classifier:
 
     def build_optimizer(self, args: ClassifierArgs, **kwargs):
         no_decay = ['bias', 'LayerNorm.weight']
-        
-        # 遍历模型参数及其名称
-        for name, param in self.model.named_parameters():
-            print(f"Name: {name}, Size: {param.size()}")  # 打印每个参数的名称和尺寸
-        
-        #for n, p in self.model.named_parameters() :
-            #if 'global_step' in n:
-                #print("global_step在参数里面")
-            #else:
-                #print("global_step不在参数里面")
-    
+      
         # 定义参数分组
         optimizer_grouped_parameters = [
             {
