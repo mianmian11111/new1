@@ -42,7 +42,6 @@ class BertForSequenceClassification(BertPreTrainedModel):
         self.classifier = nn.Linear(config.hidden_size, self.config.num_labels)
  
         self.init_weights()
-        # self.layer_weights = nn.Parameter(torch.ones(12))# 层权重初始化为全1
         self.layer_weights = nn.Parameter(torch.ones(12))# 层权重初始化为全1
 
 
