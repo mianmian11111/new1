@@ -44,7 +44,6 @@ class BertForSequenceClassification(BertPreTrainedModel):
         self.init_weights()
         self.layer_weights = nn.Parameter(torch.ones(12))# 层权重初始化为全1
 
-
         # self.layer_weights.requires_grad = False  # 设置为不需要梯度
         self.softmax = nn.Softmax(dim=0)# 用于将权重归一化
  
