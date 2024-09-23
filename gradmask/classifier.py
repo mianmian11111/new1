@@ -3,6 +3,12 @@ from __future__ import absolute_import, division, print_function
 
 import os
 import math
+
+from sklearn.discriminant_analysis import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.model_selection import train_test_split
+from sklearn.neural_network import MLPClassifier
+from sklearn.svm import SVC
 import torch
 import logging
 import numpy as np
@@ -50,6 +56,13 @@ from textattack.attack_results import SuccessfulAttackResult, FailedAttackResult
 from utils.public import auto_create
 from utils.certify import predict, lc_bound, population_radius_for_majority, population_radius_for_majority_by_estimating_lambda, population_lambda
 from torch.optim.adamw import AdamW
+import pandas as pd
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import classification_report, accuracy_score
+import ast
+import joblib  # 用于保存和加载模型
 
 
 class Classifier:
@@ -62,13 +75,21 @@ class Classifier:
                         'augmentation': self.augmentation,
                         'certify': self.certify,
                         'statistics': self.statistics,
-                        'output_hidden': self.output_hidden
+                        'output_hidden': self.output_hidden,
+                        'train_sim': self.train_sim,
+                        'evaluate_sim': self.evaluate_sim
                         }# 'certify': self.certify}
         assert args.mode in self.methods, 'mode {} not found'.format(args.mode)
 
         # for data_reader and processing
         self.data_reader, self.tokenizer, self.data_processor = self.build_data_processor(args)
         self.model = self.build_model(args)
+        # self.classifier_sim = RandomForestClassifier(n_estimators=100, random_state=42)
+        # self.classifier_sim = LogisticRegression(random_state=42)
+        self.classifier_sim = MLPClassifier(hidden_layer_sizes=(100,), max_iter=500, random_state=42)
+        # self.classifier_sim = SVC(kernel='linear', random_state=42)  # 线性核
+
+
         self.type_accept_instance_as_input = ['conat', 'sparse', 'safer']
         self.loss_function = self.build_criterion(args.dataset_name)
         
@@ -88,10 +109,21 @@ class Classifier:
         assert os.path.exists(load_path) and os.path.isfile(load_path), '{} not exits'.format(load_path)
         self.model.load_state_dict(torch.load(load_path), strict=False)
         logging.info('Loading model from {}'.format(load_path))
+        return self.model
 
     def build_optimizer(self, args: ClassifierArgs, **kwargs):
         no_decay = ['bias', 'LayerNorm.weight']
-      
+        
+        # 遍历模型参数及其名称
+        #for name, param in self.model.named_parameters():
+            #print(f"Name: {name}, Size: {param.size()}")  # 打印每个参数的名称和尺寸
+        
+        #for n, p in self.model.named_parameters() :
+            #if 'global_step' in n:
+                #print("global_step在参数里面")
+            #else:
+                #print("global_step不在参数里面")
+    
         # 定义参数分组
         optimizer_grouped_parameters = [
             {
@@ -105,7 +137,7 @@ class Classifier:
             {
                 "params": [p for n, p in self.model.named_parameters() if 'layer_weights' in n],
                 "weight_decay": 0.0,  # 通常不对layer_weights应用权重衰减
-                "lr": args.learning_rate*10 # 使用特定的学习率
+                "lr": args.learning_rate*7 # 使用特定的学习率
             } 
 
         ]
@@ -119,14 +151,18 @@ class Classifier:
         # config_class: PreTrainedConfig
         # model_class: PreTrainedModel
         config_class, model_class, _ = PRETRAINED_MODEL_TYPE.MODEL_CLASSES[args.model_type]
+        # config = BertConfig.from_pretrained("bert-base-uncased", num_labels=num_labels, hidden_dropout_prob=hidden_dropout_prob)
         config = config_class.from_pretrained(
             args.model_name_or_path,
             num_labels=self.data_reader.NUM_LABELS,
             finetuning_task=args.dataset_name,
             output_hidden_states=True,
         )
+        # 用model = BertForSequenceClassification.from_pretrained("bert-base-uncased", config=config)来加载模型
+        # 那么线性层 + 激活函数的权重就会随机初始化。
+        # 我们的目的，就是通过微调，学习到线性层 + 激活函数的权重。
         model = model_class.from_pretrained(
-            args.model_name_or_path,
+            args.model_name_or_path,# bert-base-uncased 只包含 BertModel 的权重
             from_tf=bool('ckpt' in args.model_name_or_path),
             config=config
         )
@@ -205,6 +241,29 @@ class Classifier:
 
         attacker = build_english_attacker(args, model_wrapper)
         return attacker
+    
+    def get_model(self, args: ClassifierArgs, **kwargs):
+        if args.training_type == 'sparse' or args.training_type == 'safer':
+            if args.dataset_name in ['agnews', 'imdb']:
+                batch_size = 300
+            else:
+                batch_size = 600
+            if args.training_type == 'sparse':
+                model_wrapper = HuggingFaceModelMaskEnsembleWrapper(args, 
+                                            self.model, 
+                                            self.tokenizer, 
+                                            batch_size=batch_size)
+            else:
+                model_wrapper = HuggingFaceModelSaferEnsembleWrapper(args, 
+                                                                    self.model, 
+                                                                    self.tokenizer, 
+                                                                    batch_size=batch_size)
+        else:
+            model_wrapper = HuggingFaceModelWrapper(self.model, self.tokenizer, batch_size=args.batch_size)
+        
+
+        attacker = build_english_attacker(args, model_wrapper)
+        return model_wrapper
 
     def build_writer(self, args: ClassifierArgs, **kwargs) -> Union[SummaryWriter, None]:
         writer = None
@@ -263,21 +322,54 @@ class Classifier:
             # if best_metric is None, update it with epoch metric directly, otherwise compare it with epoch_metric
             if best_metric is None or metric > best_metric:
                 best_metric = metric
-                self.save_model_to_file(args.saving_dir, args.build_saving_file_name(description='best'))
+                self.save_model_to_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
         
         if args.training_type == 'sparse' and args.incremental_trick and args.saving_last_epoch:
-            self.save_model_to_file(args.saving_dir, args.build_saving_file_name(description='best'))
+            self.save_model_to_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
         self.evaluate(args)
         
-
-
     @torch.no_grad()
     def evaluate(self, args: ClassifierArgs, is_training=False) -> Metric:
         if is_training:
             logging.info('Using current modeling parameter to evaluate')
             data_type = 'dev'
         else:
-            self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description='best'))
+            # 是否加载微调后的参数，不加载就是微调前的bert模型
+            if args.parameter_fine_tuning == True:
+                self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
+            data_type = args.evaluation_data_type # test
+        self.model.eval()
+
+        dataset, data_loader = self.build_data_loader(args, data_type)
+        epoch_iterator = tqdm(data_loader)
+
+        all_hidden_stages = []
+        metric = DATASET_TYPE.get_evaluation_metric(args.dataset_name,compare_key=args.compare_key)
+        for step, batch in enumerate(epoch_iterator):
+            assert isinstance(batch[0], torch.Tensor)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            batch = tuple(t.to(device) for t in batch)
+            golds = batch[3]
+            inputs = convert_batch_to_bert_input_dict(batch, args.model_type)
+            outputs = self.model.forward(**inputs)
+            logits = outputs.logits# logits, (hidden_states), (attentions)这里输出的是隐藏层经过dropout和classifier的预测结果
+            losses = self.loss_function(logits.view(-1, self.data_reader.NUM_LABELS), golds.view(-1))
+            epoch_iterator.set_description('loss: {:.4f}'.format(torch.mean(losses)))
+            metric(losses, logits, golds)
+
+        print(metric)
+        logging.info(metric)
+        return metric
+
+    @torch.no_grad()
+    def 层_evaluate(self, args: ClassifierArgs, is_training=False) -> Metric:
+        if is_training:
+            logging.info('Using current modeling parameter to evaluate')
+            data_type = 'dev'
+        else:
+            # 是否加载微调后的参数，不加载就是微调前的bert模型
+            if args.parameter_fine_tuning == True:
+                self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description='best'))
             data_type = args.evaluation_data_type # test
         self.model.eval()
 
@@ -292,7 +384,7 @@ class Classifier:
             golds = batch[3]
             inputs = convert_batch_to_bert_input_dict(batch, args.model_type)
             outputs = self.model.forward(**inputs)
-            logits_list = outputs[0]# logits(此处已改为12层logits的列表), (hidden_states), (attentions)这里输出的是隐藏层经过dropout和classifier的预测结果
+            logits_list = outputs.logits# logits(此处已改为12层logits的列表), (hidden_states), (attentions)这里输出的是隐藏层经过dropout和classifier的预测结果
             # print("logits_list_len:", len(logits_list))
 
             total_loss = 0 # 初始化总损失
@@ -307,7 +399,7 @@ class Classifier:
             # pred_labels = torch.argmax(probabilities, dim=1)    
             # print(f"\tpred_lable:{pred_labels},probabilities:{probabilities}\t") 
             epoch_iterator.set_description('loss: {:.4f}'.format(torch.mean(total_loss).item()))
-            metric(total_loss, logits_list[args.layer], golds)
+            metric(total_loss, logits_list[args.tag], golds)
 
         print(metric)
         logging.info(metric)
@@ -317,7 +409,9 @@ class Classifier:
     # 生成攻击前后数据的隐藏层，方便求相似度
     @torch.no_grad()
     def output_hidden(self, args: ClassifierArgs, is_training=False) -> Metric:
-        # self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description='best'))
+        # 是否加载微调后的参数，不加载就是微调前的bert模型
+        if args.parameter_fine_tuning == True:
+            self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
         data_type = args.hidden_data_type # 改1：攻击前或者攻击后的数据
         self.model.eval()
 
@@ -333,8 +427,8 @@ class Classifier:
             golds = batch[3]
             inputs = convert_batch_to_bert_input_dict(batch, args.model_type)
             outputs = self.model.forward(**inputs)
-            logits = outputs[0]# logits, (hidden_states), (attentions)这里输出的是隐藏层经过dropout和classifier的预测结果
-            hidden_states = outputs[1]
+            logits = outputs.logits# logits, (hidden_states), (attentions)这里输出的是隐藏层经过dropout和classifier的预测结果
+            hidden_states = outputs.hidden_states
             all_hidden_stages.append(hidden_states)
             # print("hidden_states[0].shape:",hidden_states[0].shape)#batch_size,token,768
             # 算出各个类别的概率
@@ -380,8 +474,16 @@ class Classifier:
         # 将所有(13, batch_size, token, 768)的数组沿着batch_size拼在一起
         stacked_arrays = np.concatenate(all_hidden_array, axis=1)
         print("shape of stacked_arrays:", stacked_arrays.shape)
+        # 只取那一层的隐藏层输出layer=[0,12]，layer = 1代表取第1层，因为layer=0是输入bert的的嵌入层
+        # stacked_arrays = stacked_arrays[args.tag]
+        # print("shape of layer_arrays:", stacked_arrays.shape)
+
         # 将堆叠后的数组存储为文件
-        np.save(f'result_log/sst2_bert/hidden_stages/{args.hidden_data_type}.npy', stacked_arrays)#改2：隐藏层存入哪里
+        if args.parameter_fine_tuning == True:
+            np.save(f'result_log/sst2_bert/hidden_states/{args.hidden_data_type}{str(args.tag)}微调后.npy', stacked_arrays)#改2：隐藏层存入哪里
+        else:
+            np.save(f'result_log/sst2_bert/hidden_states/{args.hidden_data_type}{str(args.tag)}原始.npy', stacked_arrays)#改2：隐藏层存入哪里
+
 
     # 填充all_hidden_array
     def combine_arrays_with_padding(self, all_hidden_array):
@@ -399,9 +501,109 @@ class Classifier:
             padded_arrays.append(padded_arr)
     
         return padded_arrays
+    
+
+    def train_sim0(self, args: ClassifierArgs):
+        # 读取 CSV 文件
+        try:
+            df = pd.read_csv('/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/sst2/sentence_layer_sim/bert_if_fine_tuning/all_train.csv')
+        except FileNotFoundError:
+            print("Error: The file was not found.")
+            return
+
+        # 打印原始数据
+        print("Original DataFrame:")
+        print(df.head())
+
+        # 将 layers_sim 列中的字符串转换为列表
+        df['layers_sim'] = df['layers_sim'].apply(ast.literal_eval)
+
+        # 提取特征和标签
+        X = np.array(df['layers_sim'].tolist())  # 特征：layers_sim 列
+        y = df['status'].values  # 标签：status 列
+
+        # 划分训练集和测试集
+        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+        # 特征标准化
+        scaler = StandardScaler()
+        X_train = scaler.fit_transform(X_train)
+        X_test = scaler.transform(X_test)
+
+        # 选择分类器，这里以随机森林为例
+        classifier = LogisticRegression(random_state=42)
+
+        # 训练模型
+        classifier.fit(X_train, y_train)
+
+        
+        # 保存模型
+        joblib.dump(classifier, '/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/save_models/sst2_bert/sim_models/random_forest_model1.pkl')
+        print("Model trained and saved as random_forest_model.pkl")
+       
+        # 预测
+        y_pred = classifier.predict(X_test)
+
+        # 评估模型
+        print("Accuracy:", accuracy_score(y_test, y_pred))
+        print(classification_report(y_test, y_pred))
+
+        # 预测新数据示例
+        new_layers_sim = [[0.9982, 0.9766, 0.9409, 0.8758, 0.8359, 0.8157, 0.7864, 0.7004, 0.6383, 0.5599, 0.4316, 0.3738]]
+        new_layers_sim = scaler.transform(new_layers_sim)  # 标准化新数据
+        prediction = classifier.predict(new_layers_sim)
+        print("Predicted Status for new data:", prediction)
 
 
 
+    def train_sim(self, args: ClassifierArgs):
+        # 读取 CSV 文件
+        df = pd.read_csv('/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/sst2/sentence_layer_sim/bert_if_fine_tuning/all_train.csv')
+
+        # 将 layers_sim 列中的字符串转换为列表
+        df['layers_sim'] = df['layers_sim'].apply(ast.literal_eval)
+
+        # 提取特征和标签
+        X = np.array(df['layers_sim'].tolist())  # 特征：layers_sim 列
+        y = df['status'].values  # 标签：status 列
+
+        # 训练模型，使用整个train数据集
+        self.classifier_sim.fit(X, y)
+        
+        # 保存模型
+        joblib.dump(self.classifier_sim, '/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/save_models/sst2_bert/sim_models/random_forest_model_SVM.pkl')
+        print("Model trained and saved as random_forest_model.pkl")
+        
+        self.evaluate_sim(args, is_training=True)
+
+
+
+    def evaluate_sim(self, args: ClassifierArgs, is_training = False):
+        if is_training:
+            print('Using current modeling parameter to evaluate')
+        else:
+            # 加载模型
+            self.classifier_sim = joblib.load('/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/save_models/sst2_bert/sim_models/random_forest_model_MLP.pkl')
+            print("load model from file.")
+            
+        # 读取 CSV 文件
+        df = pd.read_csv('/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/sst2/sentence_layer_sim/bert_if_fine_tuning/all_test.csv')
+
+        # 将 layers_sim 列中的字符串转换为列表
+        df['layers_sim'] = df['layers_sim'].apply(ast.literal_eval)
+
+        # 提取特征和标签
+        X = np.array(df['layers_sim'].tolist())  # 特征：layers_sim 列
+        y = df['status'].values  # 标签：status 列
+
+        # 预测
+        y_pred = self.classifier_sim.predict(X)  # 直接使用整个特征集进行预测
+
+        # 评估模型
+        print("Accuracy:", accuracy_score(y, y_pred))
+        print(classification_report(y, y_pred))
+
+        
     @torch.no_grad()
     def infer(self, args: ClassifierArgs) -> Dict:
         content = args.content
@@ -409,7 +611,7 @@ class Classifier:
         content = content.strip()
         assert content != '' and len(content) != 0, 'in infer mode, parameter content cannot be empty! '
 
-        self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description='best'))
+        self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
         self.model.eval()
 
         predictor = Predictor(self.model, self.data_processor, args.model_type)
@@ -436,7 +638,7 @@ class Classifier:
     @torch.no_grad()
     def predict(self, args: ClassifierArgs, **kwargs):
         # self.evaluate(args, is_training=False)
-        self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description='best'))
+        self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
         self.model.eval()
         predictor = Predictor(self.model, self.data_processor, args.model_type)
 
@@ -458,8 +660,47 @@ class Classifier:
             description.set_description(metric.__str__())
         print(metric)
         logging.info(metric)
+        
     
     def attack(self, args: ClassifierArgs, **kwargs):
+        # self.evaluate(args, is_training=False)
+        # self.evaluate(args, is_training=False)
+        self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
+        self.model.eval()
+
+        # build test dataset 
+        dataset, _ = self.build_data_loader(args, args.evaluation_data_type, tokenizer=False)
+        test_instances = dataset.data
+       
+        # build attacker
+        attacker = self.build_attacker(args)
+
+        attacker_log_path = '{}'.format(args.build_logging_path())
+        attacker_log_path = os.path.join(args.logging_dir, attacker_log_path)
+        attacker_log_manager = AttackLogManager()
+        # attacker_log_manager.enable_stdout()
+        attacker_log_manager.add_output_file(os.path.join(attacker_log_path, '{}.txt'.format(args.attack_method)))
+        
+        for i in range(args.attack_times):
+            print("Attack time {}".format(i))
+            
+            choice_instances = np.random.choice(test_instances, size=(args.attack_numbers,),replace=False)
+            dataset = CustomTextAttackDataset.from_instances(args.dataset_name, choice_instances, self.data_reader.get_labels())
+            results_iterable = attacker.attack_dataset(dataset)
+            description = tqdm(results_iterable, total=len(choice_instances))
+            result_statistics = SimplifidResult()
+            for result in description:
+                try:
+                    attacker_log_manager.log_result(result)
+                    result_statistics(result)
+                    description.set_description(result_statistics.__str__())
+                except RuntimeError as e:
+                    print('error in process')
+
+        attacker_log_manager.enable_stdout()
+        attacker_log_manager.log_summary()
+
+    def 改_attack(self, args: ClassifierArgs, **kwargs):
         # self.evaluate(args, is_training=False)
         # self.evaluate(args, is_training=False)
         self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description='best'))
@@ -484,7 +725,8 @@ class Classifier:
             print("Attack time {}".format(i))
             
            # choice_instances = np.choice(test_instances, size=(args.attack_numbers,),replace=False)
-            choice_instances = test_instances[:args.attack_numbers]
+            choice_instances = np.random.choice(test_instances, size=(args.attack_numbers,),replace=False)
+            # choice_instances = test_instances[:args.attack_numbers]
             dataset = CustomTextAttackDataset.from_instances(args.dataset_name, choice_instances, self.data_reader.get_labels())
             results_iterable = attacker.attack_dataset(dataset)
             description = tqdm(results_iterable, total=len(choice_instances))
@@ -506,7 +748,7 @@ class Classifier:
         csv_logger.flush()
 
     def augmentation(self, args: ClassifierArgs, **kwargs):
-        self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description='best'))
+        self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
         self.model.eval()
 
         train_instances, _ = self.build_data_loader(args, 'train', tokenizer=False)
