@@ -4,7 +4,8 @@ import logging
 import argparse
 import pandas as pd
 from overrides import overrides
-from utils.config import DATASET_TYPE, PRETRAINED_MODEL_TYPE
+# from utils.config import DATASET_TYPE 
+# from utils.config import PRETRAINED_MODEL_TYPE
 from utils import check_and_create_path, set_seed
 from baseargs import ProgramArgs
 
@@ -19,13 +20,20 @@ class ClassifierArgs(ProgramArgs):
         self.attacked_data_type = 'att'
         self.attack_data_type = 'test'
         self.hidden_data_type = 'att'
-        self.layer = 11
+	    # 表示best_model的后缀，代表当前是哪个模型
+        self.tag = 12
+        self.layer = 12
+        # 是否使用微调后的模型参数
+        self.parameter_fine_tuning = True
+
 
 
         self.dataset_name = 'sst2'
         self.dataset_dir = '/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset'
         self.model_type = 'bert'
-        self.model_name_or_path = '/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/bert-base-uncased'
+        self.model_name_or_path = '/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/bert-model/bert-base-uncased'
+        #self.model_type = 'bert-sst2'
+        #self.model_name_or_path = '/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/bert-base-uncased-SST-2'
         # self.model_type = 'roberta'
         # self.model_name_or_path = 'roberta-base'
         self.k_nums=1
@@ -93,7 +101,7 @@ class ClassifierArgs(ProgramArgs):
 
         # for attack
         self.attack_times = 1 # attack times for average record
-        self.attack_method = 'bae' # attack algorithm
+        self.attack_method = 'deepwordbug' # attack algorithm
         self.attack_numbers = 1000 # the examples numbers to be attack
         self.ensemble_method = 'votes' # in [votes mean], the ensemble type, Ses RanMASK paper
 
@@ -128,16 +136,18 @@ class ClassifierArgs(ProgramArgs):
         set_seed(self.seed)
 
     def build_dataset_dir(self):
-        assert self.dataset_name in DATASET_TYPE.DATA_READER.keys(), 'dataset not found {}'.format(self.dataset_name)
+        #assert self.dataset_name in DATASET_TYPE.DATA_READER.keys(), 'dataset not found {}'.format(self.dataset_name)
         testing_file = ['train.json', 'train.txt', 'train.csv', 'train.tsv']
         for file in testing_file:
             train_file_path = os.path.join(self.dataset_dir, file)
             if os.path.exists(train_file_path) and os.path.isfile(train_file_path):
+                print(f"Found dataset file: {train_file_path}")
                 return
         self.dataset_dir = os.path.join(self.dataset_dir, self.dataset_name)
         for file in testing_file:
             train_file_path = os.path.join(self.dataset_dir, file)
             if os.path.exists(train_file_path) and os.path.isfile(train_file_path):
+                print(f"Found dataset file: {train_file_path}")
                 return
         raise FileNotFoundError("Dataset file cannot be found in dir {}".format(self.dataset_dir))
 
