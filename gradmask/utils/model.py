@@ -1,9 +1,14 @@
+
+from args原 import ClassifierArgs
+
 from transformers import BertPreTrainedModel, BertModel
 from torch import nn
 from transformers.modeling_outputs import SequenceClassifierOutput
 from torch.nn import CrossEntropyLoss
 import torch
 import numpy
+from transformers.modeling_outputs import SequenceClassifierOutput
+
 
 
 class BertForSequenceClassification(BertPreTrainedModel):
@@ -40,12 +45,8 @@ class BertForSequenceClassification(BertPreTrainedModel):
         self.bert = BertModel(config)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.classifier = nn.Linear(config.hidden_size, self.config.num_labels)
- 
+        self.args = ClassifierArgs()
         self.init_weights()
-        self.layer_weights = nn.Parameter(torch.ones(12))# 层权重初始化为全1
-
-        # self.layer_weights.requires_grad = False  # 设置为不需要梯度
-        self.softmax = nn.Softmax(dim=0)# 用于将权重归一化
  
     def forward(self, input_ids, token_type_ids=None, attention_mask=None, labels=None,
                 position_ids=None, head_mask=None, output_hidden_states=True):
@@ -53,23 +54,25 @@ class BertForSequenceClassification(BertPreTrainedModel):
                             attention_mask=attention_mask, head_mask=head_mask, 
                             output_hidden_states=output_hidden_states,)
         pooled_output_1 = outputs[1]
-        hidden_states = outputs[2] # 元组13个tensor( 32, 59, 768)，batch，token，sequence_length
+        hidden_states = outputs[2] # 元组13个tensor( 32, 59, 768)
 
-        num_layers = len(hidden_states) # 13，1个嵌入层hidden_states[0]+12个隐藏层
+        hidden_layer = 12
+        # 0-12
 
-        # 将12个层的logits存入logits_list列表     
-        logits_list = []
-
-        # i从1到12，只取隐藏层，不取hidden_states[0]
-        for i in range(1,num_layers):
-            # pooled_output取所有token的平均值
-            pooled_output = torch.mean(hidden_states[i][:,1:,:],dim=1) 
-            pooled_output = self.dropout(pooled_output)
-            logits = self.classifier(pooled_output)
-            logits_list.append(logits)  # 保存每层的logits
+        pooled_output = torch.mean(hidden_states[hidden_layer][:,1:,:],dim=1) 
+        
+        pooled_output = self.dropout(pooled_output)
+        logits = self.classifier(pooled_output)
  
-        outputs = (logits_list,) + outputs[2:]  # add hidden states and attention if they are here
- 
+        # outputs = (logits,) + outputs[2:]  # add hidden states and attention if they are here
+        
+        loss = None  # 确保 loss 有一个初始值
+        outputs = SequenceClassifierOutput(
+            loss=loss,
+            logits=logits,
+            hidden_states=outputs.hidden_states,
+            attentions=outputs.attentions,
+        )
         if labels is not None:
             if self.num_labels == 1:
                 #  We are doing regression
