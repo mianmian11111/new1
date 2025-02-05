@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import absolute_import, division, print_function
 
+import gc
 import os
 import math
 
@@ -9,6 +10,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.neural_network import MLPClassifier
 from sklearn.svm import SVC
+from sklearn.tree import DecisionTreeClassifier
 import torch
 import logging
 import numpy as np
@@ -23,7 +25,7 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import PreTrainedTokenizer
 from utils.model import BertForSequenceClassification
 from textattack.loggers.csv_logger import CSVLogger
-
+from sklearn.metrics.pairwise import cosine_similarity
 
 
 from args import ClassifierArgs
@@ -77,17 +79,31 @@ class Classifier:
                         'statistics': self.statistics,
                         'output_hidden': self.output_hidden,
                         'train_sim': self.train_sim,
-                        'evaluate_sim': self.evaluate_sim
+                        'evaluate_sim': self.evaluate_sim,
+                        'output_pred': self.output_pred,
+                        'train_pred': self.train_pred,
+                        'evaluate_if_succ': self.evaluate_if_succ, 
+                        'attack_csv_to_txt': self.attack_csv_to_txt,
+                        'output_sim': self.output_sim,
+                        'evaluate_pred': self.evaluate_pred,
+                        'run_sim': self.sim
                         }# 'certify': self.certify}
         assert args.mode in self.methods, 'mode {} not found'.format(args.mode)
 
         # for data_reader and processing
         self.data_reader, self.tokenizer, self.data_processor = self.build_data_processor(args)
         self.model = self.build_model(args)
-        # self.classifier_sim = RandomForestClassifier(n_estimators=100, random_state=42)
-        # self.classifier_sim = LogisticRegression(random_state=42)
-        self.classifier_sim = MLPClassifier(hidden_layer_sizes=(100,), max_iter=500, random_state=42)
-        # self.classifier_sim = SVC(kernel='linear', random_state=42)  # 线性核
+        self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
+        if args.classifier == 'MLP':
+            self.classifier = MLPClassifier(hidden_layer_sizes=(100,100,100,100,100,100), max_iter=200, random_state=42)
+        elif args.classifier == 'SVM':
+            self.classifier = SVC(kernel='linear', random_state=42)  # 线性核
+        elif args.classifier == 'DTC':
+            self.classifie = DecisionTreeClassifier(random_state=42) # 决策树分类器
+        elif args.classifier == 'LR':
+            self.classifier = LogisticRegression(random_state=42)
+        elif args.classifier == 'RFC':
+            self.classifier = RandomForestClassifier(n_estimators=100, random_state=42)
 
 
         self.type_accept_instance_as_input = ['conat', 'sparse', 'safer']
@@ -96,7 +112,6 @@ class Classifier:
         self.forbidden_words = None
         if args.keep_sentiment_word:
             self.forbidden_words = build_forbidden_mask_words(args.sentiment_path)
-
     def save_model_to_file(self, save_dir: str, file_name: str):
         save_file_name = '{}.pth'.format(file_name)
         save_path = os.path.join(save_dir, save_file_name)
@@ -167,10 +182,12 @@ class Classifier:
             config=config
         )
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        #model = nn.DataParallel(model, device_ids=[0, 1, 2, 3]) 
         model.to(device)
         # 添加钩子以打印中间层输出
         # self.add_hooks(model)
         return model
+
 
     # def add_hooks(self, model):
     #     # 为BERT的每一层添加钩子
@@ -178,6 +195,7 @@ class Classifier:
     #         layer.register_forward_hook(
     #             lambda module, input, output, layer_num=layer_num: print(f"Layer {layer_num}: {output}")
     #         )
+    
 
 
     def build_data_processor(self, args: ClassifierArgs, **kwargs) -> List[Union[DataReader, PreTrainedTokenizer, DataProcessor]]:
@@ -241,29 +259,6 @@ class Classifier:
 
         attacker = build_english_attacker(args, model_wrapper)
         return attacker
-    
-    def get_model(self, args: ClassifierArgs, **kwargs):
-        if args.training_type == 'sparse' or args.training_type == 'safer':
-            if args.dataset_name in ['agnews', 'imdb']:
-                batch_size = 300
-            else:
-                batch_size = 600
-            if args.training_type == 'sparse':
-                model_wrapper = HuggingFaceModelMaskEnsembleWrapper(args, 
-                                            self.model, 
-                                            self.tokenizer, 
-                                            batch_size=batch_size)
-            else:
-                model_wrapper = HuggingFaceModelSaferEnsembleWrapper(args, 
-                                                                    self.model, 
-                                                                    self.tokenizer, 
-                                                                    batch_size=batch_size)
-        else:
-            model_wrapper = HuggingFaceModelWrapper(self.model, self.tokenizer, batch_size=args.batch_size)
-        
-
-        attacker = build_english_attacker(args, model_wrapper)
-        return model_wrapper
 
     def build_writer(self, args: ClassifierArgs, **kwargs) -> Union[SummaryWriter, None]:
         writer = None
@@ -314,6 +309,7 @@ class Classifier:
 
             # saving model according to epoch_time
             self.saving_model_by_epoch(args, epoch_time)
+            self.save_model_to_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
 
             # evaluate model according to epoch_time
             metric = self.evaluate(args, is_training=True)
@@ -336,14 +332,13 @@ class Classifier:
         else:
             # 是否加载微调后的参数，不加载就是微调前的bert模型
             if args.parameter_fine_tuning == True:
-                self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
+                self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}')) # {args.tag}
             data_type = args.evaluation_data_type # test
         self.model.eval()
 
         dataset, data_loader = self.build_data_loader(args, data_type)
         epoch_iterator = tqdm(data_loader)
 
-        all_hidden_stages = []
         metric = DATASET_TYPE.get_evaluation_metric(args.dataset_name,compare_key=args.compare_key)
         for step, batch in enumerate(epoch_iterator):
             assert isinstance(batch[0], torch.Tensor)
@@ -356,9 +351,202 @@ class Classifier:
             losses = self.loss_function(logits.view(-1, self.data_reader.NUM_LABELS), golds.view(-1))
             epoch_iterator.set_description('loss: {:.4f}'.format(torch.mean(losses)))
             metric(losses, logits, golds)
-
+        
         print(metric)
         logging.info(metric)
+        return metric
+    
+    # 取出att_test攻击成功里能该表标签的数据
+    @torch.no_grad()
+    def evaluate_if_succ(self, args: ClassifierArgs, is_training=False):
+        for attack in args.attack_list:
+            if is_training:
+                logging.info('Using current modeling parameter to evaluate')
+                # data_type = 'dev'
+            else:
+                if args.parameter_fine_tuning:
+                    self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
+                # data_type = args.evaluation_data_type
+            for data_type in args.attacked_data_type:
+                org_data_dir = f'att_data/{attack}/org_{data_type}'
+                self.model.eval()
+                # 评估攻击前的数据
+                dataset_org, data_loader_org = self.build_data_loader(args, org_data_dir)
+                epoch_iterator_org = tqdm(data_loader_org)
+
+                # 保存攻击前的预测结果
+                predictions_org = []
+                metric_org = DATASET_TYPE.get_evaluation_metric(args.dataset_name, compare_key=args.compare_key)
+
+                for step, batch in enumerate(epoch_iterator_org):
+                    assert isinstance(batch[0], torch.Tensor)
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    batch = tuple(t.to(device) for t in batch)
+                    golds = batch[3]
+                    inputs = convert_batch_to_bert_input_dict(batch, args.model_type)
+                    
+                    outputs = self.model.forward(**inputs)
+                    logits = outputs.logits
+
+                    # 获取攻击前的预测结果
+                    predictions = torch.argmax(logits, dim=-1)
+                    predictions_org.extend(predictions.cpu().numpy())
+                    losses = self.loss_function(logits.view(-1, self.data_reader.NUM_LABELS), golds.view(-1))
+                    metric_org(losses, logits, golds)
+
+                # 评估攻击后的数据
+                att_data_dir = f'att_data/{attack}/att_{data_type}'
+                dataset_att, data_loader_att = self.build_data_loader(args, att_data_dir)
+                epoch_iterator_att = tqdm(data_loader_att)
+                
+                # 保存攻击后的预测结果
+                predictions_att = []
+                metric_att = DATASET_TYPE.get_evaluation_metric(args.dataset_name, compare_key=args.compare_key)
+
+
+                for step, batch in enumerate(epoch_iterator_att):
+                    assert isinstance(batch[0], torch.Tensor)
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    batch = tuple(t.to(device) for t in batch)
+                    golds = batch[3]
+                    inputs = convert_batch_to_bert_input_dict(batch, args.model_type)
+                    
+                    outputs = self.model.forward(**inputs)
+                    logits = outputs.logits
+
+                    # 获取攻击后的预测结果
+                    predictions = torch.argmax(logits, dim=-1)
+                    predictions_att.extend(predictions.cpu().numpy())
+                    losses = self.loss_function(logits.view(-1, self.data_reader.NUM_LABELS), golds.view(-1))
+                    metric_att(losses, logits, golds)
+
+                # 生成掩码，表示攻击前后预测结果是否不同,攻击前后预测结果不同则为True
+                mask = (np.array(predictions_org) != np.array(predictions_att))
+
+                # 将 mask 转换为 tensor
+                filtered_mask = torch.tensor(mask)
+
+                # 计算 True 的概率
+                true_count = filtered_mask.sum().item()
+                total_count = filtered_mask.size(0)
+
+                # 计算 True 的概率
+                true_probability = true_count / total_count if total_count > 0 else 0.0
+
+                # 打印或记录 mask
+                print("Mask (True indicates prediction changed):", filtered_mask)
+                print(f"Probability of True in mask: {true_probability:.4f}")
+                
+                # 读取 test.txt 文件被攻击后的数据，evaluation_data_type是test
+                with open(f'dataset/{args.dataset_name}/{att_data_dir}.txt', 'r') as att_file:
+                    att_data = att_file.readlines()  # 读取所有行
+                with open(f'dataset/{args.dataset_name}/{org_data_dir}.txt', 'r') as org_file:
+                    org_data = org_file.readlines()
+
+                # 确保 combined_mask 和数据集长度匹配
+                assert len(filtered_mask) == len(att_data), "combined_mask length must match the length of the dataset."
+
+                # 使用 combined_mask 筛选出攻击不成功的数据
+                # combined_mask 为 True 表示攻击成功，反之为失败，保留combined_mask为True的数据
+                filtered_att_data = [att_data[i] for i in range(len(filtered_mask)) if filtered_mask[i]]
+                filtered_org_data = [org_data[i] for i in range(len(filtered_mask)) if filtered_mask[i]]
+
+                att_data_succ = f'dataset/{args.dataset_name}/att_data/{attack}/att_{data_type}_succ.txt'
+                org_data_succ = f'dataset/{args.dataset_name}/att_data/{attack}/org_{data_type}_succ.txt'
+                # 将过滤后的扰动数据保存到新的文件
+                with open(att_data_succ, 'w') as file:
+                    file.writelines(filtered_att_data)
+                print(f"att Filtered data saved to {att_data_succ}, total {len(att_data)} samples,save {len(filtered_att_data)}")
+
+                # 将过滤后的原始数据保存到新的文件
+                with open(org_data_succ, 'w') as file:
+                    file.writelines(filtered_org_data)
+                print(f"org Filtered data saved to {org_data_succ}, total {len(att_data)} samples,save {len(filtered_att_data)}")
+
+                args.evaluation_data_type = f'att_data/{attack}/att_{data_type}_succ'
+                metric_att_succ = self.evaluate(args)
+                args.evaluation_data_type = f'att_data/{attack}/org_{data_type}_succ'
+                metric_org_succ = self.evaluate(args)
+                
+
+                tag = args.evaluation_data_type
+                print(f'{tag}_att:', metric_att)
+                print(f'{tag}_org:', metric_org)
+                print(f'succ_{tag}_att:', metric_att_succ)
+                print(f'succ_{tag}_org:', metric_org_succ)
+        return filtered_mask  # 返回 metric 和 mask
+        
+    @torch.no_grad()
+    def output_pred(self, args: ClassifierArgs, is_training=False) -> Metric:
+        if is_training:
+            logging.info('Using current modeling parameter to evaluate')
+            data_type = 'dev'
+        else:
+            # 是否加载微调后的参数，不加载就是微调前的bert模型
+            if args.parameter_fine_tuning == True:
+                self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description=f'best-12')) # {args.tag}
+            data_type = args.pred_data_type # test
+        self.model.eval()
+
+        for attack in args.attack_list:
+            for data_type in args.pred_data_type:
+                data_dir = f'att_data/{attack}/{data_type}'
+                dataset, data_loader = self.build_data_loader(args, data_dir)
+                epoch_iterator = tqdm(data_loader)
+
+                # 在循环外部初始化一个空列表来存储所有批次的正确类别概率
+                all_correct_class_probabilities = []
+                metric = DATASET_TYPE.get_evaluation_metric(args.dataset_name,compare_key=args.compare_key)
+                for step, batch in enumerate(epoch_iterator):
+                    assert isinstance(batch[0], torch.Tensor)
+                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                    batch = tuple(t.to(device) for t in batch)
+                    golds = batch[3]
+                    inputs = convert_batch_to_bert_input_dict(batch, args.model_type)
+                    outputs = self.model.forward(**inputs)
+                    logits = outputs.logits# logits, (hidden_states), (attentions)这里输出的是隐藏层经过dropout和classifier的预测结果
+                    # 算出各个类别的概率
+                    probabilities = torch.nn.functional.softmax(logits, dim=1)  
+                    # 分类结果（选择概率最高的类别）
+                    # pred_labels = torch.argmax(probabilities, dim=1)    
+                    # 获取每个样本正确类别的预测概率
+                    correct_class_probabilities = probabilities[range(len(probabilities)), golds].tolist()
+                    # 将当前批次的正确类别概率列表追加到总列表中
+                    all_correct_class_probabilities.extend(correct_class_probabilities)
+                    # print(f"\tpred_lable:{pred_labels},probabilities:{probabilities}\t")
+                    print("len_correct_class_probabilities:", len(all_correct_class_probabilities))
+                    losses = self.loss_function(logits.view(-1, self.data_reader.NUM_LABELS), golds.view(-1))
+                    epoch_iterator.set_description('loss: {:.4f}'.format(torch.mean(losses)))
+                    metric(losses, logits, golds)
+                
+                # 将列表转换为 DataFrame
+                df_new = pd.DataFrame(all_correct_class_probabilities, columns=['layer_{}'.format(args.tag)])
+                # 保留四位小数
+                df_new = df_new.round(4) 
+                # 定义文件名
+                file_name = f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/{data_type}.csv'
+                if os.path.exists(file_name):
+                # 读取现有的 CSV 文件
+                    df_existing = pd.read_csv(file_name)
+                    
+                    # 1.将新数据追加到现有数据
+                    #df_final = pd.concat([df_existing, df_new], axis=1)
+                    # 保存到 CSV 文件
+                    #df_final.to_csv(file_name, index=False)
+                                    
+                    # 2.添加标签列，status：True/False
+                    if data_type == 'org_test' or data_type == 'org_train':
+                        df_existing['status'] = True
+                    else:
+                        df_existing['status'] = False
+                    df_existing.to_csv(file_name, index=False)
+                    
+                    print('Data saved to {}'.format(file_name))
+                else:
+                    # 如果文件不存在，直接使用新数据
+                    df_new.to_csv(file_name, index=False)
+                print(metric)
+                logging.info(metric)
         return metric
 
     @torch.no_grad()
@@ -412,44 +600,53 @@ class Classifier:
         # 是否加载微调后的参数，不加载就是微调前的bert模型
         if args.parameter_fine_tuning == True:
             self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
-        data_type = args.hidden_data_type # 改1：攻击前或者攻击后的数据
-        self.model.eval()
+            
+        tags = [1,2,3,4]
+        for attack in args.attack_list:
+            for data_type in args.hidden_data_type:
+                for i in tags:
+                    print(f"data_type:", data_type+str(i))
+                    data_dir = f'att_data/{attack}/{data_type}{i}'
+                    self.model.eval()
 
-        dataset, data_loader = self.build_data_loader(args, data_type)
-        epoch_iterator = tqdm(data_loader)
+                    dataset, data_loader = self.build_data_loader(args, data_dir)
+                    epoch_iterator = tqdm(data_loader)
 
-        all_hidden_stages = []
-        metric = DATASET_TYPE.get_evaluation_metric(args.dataset_name,compare_key=args.compare_key)
-        for step, batch in enumerate(epoch_iterator):
-            assert isinstance(batch[0], torch.Tensor)
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-            batch = tuple(t.to(device) for t in batch)
-            golds = batch[3]
-            inputs = convert_batch_to_bert_input_dict(batch, args.model_type)
-            outputs = self.model.forward(**inputs)
-            logits = outputs.logits# logits, (hidden_states), (attentions)这里输出的是隐藏层经过dropout和classifier的预测结果
-            hidden_states = outputs.hidden_states
-            all_hidden_stages.append(hidden_states)
-            # print("hidden_states[0].shape:",hidden_states[0].shape)#batch_size,token,768
-            # 算出各个类别的概率
-            probabilities = torch.nn.functional.softmax(logits, dim=1)  
-            # 分类结果（选择概率最高的类别）
-            pred_labels = torch.argmax(probabilities, dim=1)    
-            #print(f"\tpred_lable:{pred_labels},probabilities:{probabilities}\t") 
-            losses = self.loss_function(logits.view(-1, self.data_reader.NUM_LABELS), golds.view(-1))
-            epoch_iterator.set_description('loss: {:.4f}'.format(torch.mean(losses)))
-            metric(losses, logits, golds)
+                    all_hidden_stages = []
+                    metric = DATASET_TYPE.get_evaluation_metric(args.dataset_name,compare_key=args.compare_key)
+                    for step, batch in enumerate(epoch_iterator):
+                        assert isinstance(batch[0], torch.Tensor)
+                        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                        batch = tuple(t.to(device) for t in batch)
+                        golds = batch[3]
+                        inputs = convert_batch_to_bert_input_dict(batch, args.model_type)
+                        outputs = self.model.forward(**inputs)
+                        logits = outputs.logits# logits, (hidden_states), (attentions)这里输出的是隐藏层经过dropout和classifier的预测结果
+                        hidden_states = outputs.hidden_states
+                        all_hidden_stages.append(hidden_states)
+                        # print("hidden_states[0].shape:",hidden_states[0].shape)#batch_size,token,768
+                        # 算出各个类别的概率
+                        probabilities = torch.nn.functional.softmax(logits, dim=1)  
+                        # 分类结果（选择概率最高的类别）
+                        pred_labels = torch.argmax(probabilities, dim=1)    
+                        # print(f"\tpred_lable:{pred_labels},gold_lable:{golds},probabilities:{probabilities}\t") 
+                        losses = self.loss_function(logits.view(-1, self.data_reader.NUM_LABELS), golds.view(-1))
+                        epoch_iterator.set_description('loss: {:.4f}'.format(torch.mean(losses)))
+                        metric(losses, logits, golds)
+                        gc.collect()
+                        torch.cuda.empty_cache()
 
-        #for i, stage in enumerate(all_hidden_stages):
-        #torch.save(stage, f'result_log/sst2_bert/hidden_stages/hidden_stage_{i}.pt')
-        self.save_hidden_stage(args, all_hidden_stages)
-        print(metric)
-        logging.info(metric)
+
+                    #for i, stage in enumerate(all_hidden_stages):
+                    #torch.save(stage, f'result_log/sst2_bert/hidden_stages/hidden_stage_{i}.pt')
+                    print(metric)
+                    self.save_hidden_stage(args, all_hidden_stages, data_dir)
+                    logging.info(metric)
         return metric
     
 
     # 传入所有隐藏层的列表，列表num_batch*元组(13个张量*batch_size,token,768)
-    def save_hidden_stage(self, args: ClassifierArgs, all_hidden_states):
+    def save_hidden_stage(self, args: ClassifierArgs, all_hidden_states, data_dir):
         # 初始化一个空列表来存储所有数组
         all_hidden_array = []
         for hidden_stages in all_hidden_states:
@@ -480,9 +677,126 @@ class Classifier:
 
         # 将堆叠后的数组存储为文件
         if args.parameter_fine_tuning == True:
-            np.save(f'result_log/sst2_bert/hidden_states/{args.hidden_data_type}{str(args.tag)}微调后.npy', stacked_arrays)#改2：隐藏层存入哪里
+            dir = f'result_log/{args.dataset_name}_bert/hidden_states/{data_dir}{str(args.tag)}微调后.npy'
+            np.save(dir, stacked_arrays)#改2：隐藏层存入哪里
         else:
-            np.save(f'result_log/sst2_bert/hidden_states/{args.hidden_data_type}{str(args.tag)}原始.npy', stacked_arrays)#改2：隐藏层存入哪里
+            dir = f'result_log/{args.dataset_name}_bert/hidden_states/{data_dir}{str(args.tag)}原始.npy'
+            np.save(dir, stacked_arrays)#改2：隐藏层存入哪里
+            
+        print("success sava to:", dir)
+        
+    # 求'att_train', 'att_test', 'org_test', 'org_train'数据集在bert微调前后隐藏层的相似度
+    def output_sim(self, args: ClassifierArgs):
+        for attack in args.attack_list:
+            if args.dataset_name == 'sst2':
+                # 求相似度的隐藏层数据集
+                args.hidden_data_type = ['att_train', 'att_test', 'org_test', 'org_train']
+
+                # 遍历每个 data 值
+                for data_item in args.hidden_data_type:
+                    # 构建文件路径
+                    file_path1 = f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/result_log/{args.dataset_name}_bert/hidden_states/att_data/{attack}/{data_item}12原始.npy'
+                    file_path2 = f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/result_log/{args.dataset_name}_bert/hidden_states/att_data/{attack}/{data_item}12微调后.npy'
+                        
+                    # 加载 .npy 文件
+                    array1 = np.load(file_path1)
+                    array2 = np.load(file_path2)
+                        
+                    print("array1.shape:", array1.shape)
+                    print("array2.shape:", array2.shape)
+                        
+                    # 获取句子的数量
+                    n_sentences = array1.shape[1]  # 假设第二维是句子数量
+                        
+                    # 计算每个句子的每层平均表示，忽略第一个 token
+                    avg_array1 = np.mean(array1[:, :, 1:, :], axis=2)  # 形状 (13, n_sentences, 768)
+                    avg_array2 = np.mean(array2[:, :, 1:, :], axis=2)  # 形状 (13, n_sentences, 768)
+                        
+                    # 存储相似度
+                    similarity_matrix = np.zeros((n_sentences, 12))  # (n_sentences, 12)
+                        
+                    # 遍历每个句子，计算相似度
+                    for sentence in range(n_sentences):
+                        for layer in range(12):
+                            similarity_matrix[sentence, layer] = cosine_similarity(
+                                avg_array1[layer:layer+1, sentence].reshape(1, -1),  # 第 layer 层的平均表示
+                                avg_array2[layer:layer+1, sentence].reshape(1, -1)   # 第 layer 层的平均表示
+                            )[0, 0]
+                        
+                    # 将每一层相似度转为字符串列表并保留四位小数
+                    layers_sim = similarity_matrix.round(4).astype(str).tolist()  # 保留四位小数并转换为字符串列表
+                        
+                    # 创建一个 DataFrame，并将 layers_sim 作为一列
+                    df = pd.DataFrame({'layers_sim': layers_sim})
+                        
+                    # 将 status 列添加到 DataFrame
+                    if data_item  == 'att_train' or data_item  == 'att_test':
+                        df['status'] = False# 将状态列的值设为 True
+                    if data_item  == 'org_train' or data_item  == 'org_test':
+                        df['status'] = True# 将状态列的值设为 True
+                    # 构建输出文件路径
+                        
+                    output_file = f'dataset/{args.dataset_name}/sentence_layer_sim/bert_if_fine_tuning/{attack}/{data_item}.csv'
+                        
+                    # 将结果保存到 CSV 文件，只包含 layers_sim 和 status 列
+                    df.to_csv(output_file, columns=['layers_sim', 'status'], index=False)
+                        
+                    print(f"Results for {data_item} saved to {output_file}, num of sentences:", n_sentences)
+            # 完善
+            if args.dataset_name == 'imdb' or 'agnews':
+                # 定义 tag 值列表和数据列表
+                tags = [1,2,3,4]
+                # 遍历每个 data 值
+                for data_item in args.hidden_data_type:
+                    for i in tags:
+                        # 构建文件路径
+                        file_path1 = f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/result_log/{args.dataset_name}_bert/hidden_states/att_data/{attack}/{data_item}{i}12原始.npy'
+                        file_path2 = f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/result_log/{args.dataset_name}_bert/hidden_states/att_data/{attack}/{data_item}{i}12微调后.npy'
+                            
+                        # 加载 .npy 文件
+                        array1 = np.load(file_path1)
+                        array2 = np.load(file_path2)
+                            
+                        print("array1.shape:", array1.shape)
+                        print("array2.shape:", array2.shape)
+                            
+                        # 获取句子的数量
+                        n_sentences = array1.shape[1]  # 假设第二维是句子数量
+                            
+                        # 计算每个句子的每层平均表示，忽略第一个 token
+                        avg_array1 = np.mean(array1[:, :, 1:, :], axis=2)  # 形状 (13, n_sentences, 768)
+                        avg_array2 = np.mean(array2[:, :, 1:, :], axis=2)  # 形状 (13, n_sentences, 768)
+                            
+                        # 存储相似度
+                        similarity_matrix = np.zeros((n_sentences, 12))  # (n_sentences, 12)
+                            
+                        # 遍历每个句子，计算相似度
+                        for sentence in range(n_sentences):
+                            for layer in range(12):
+                                similarity_matrix[sentence, layer] = cosine_similarity(
+                                    avg_array1[layer:layer+1, sentence].reshape(1, -1),  # 第 layer 层的平均表示
+                                    avg_array2[layer:layer+1, sentence].reshape(1, -1)   # 第 layer 层的平均表示
+                                )[0, 0]
+                            
+                        # 将每一层相似度转为字符串列表并保留四位小数
+                        layers_sim = similarity_matrix.round(4).astype(str).tolist()  # 保留四位小数并转换为字符串列表
+                            
+                        # 创建一个 DataFrame，并将 layers_sim 作为一列
+                        df = pd.DataFrame({'layers_sim': layers_sim})
+                            
+                        # 将 status 列添加到 DataFrame
+                        if data_item  == 'att_train' or data_item  == 'att_test':
+                            df['status'] = False# 将状态列的值设为 True
+                        if data_item  == 'org_train' or data_item  == 'org_test':
+                            df['status'] = True# 将状态列的值设为 True
+                        # 构建输出文件路径
+                            
+                        output_file = f'dataset/{args.dataset_name}/sentence_layer_sim/bert_if_fine_tuning/{attack}/{data_item}{i}.csv'
+                            
+                        # 将结果保存到 CSV 文件，只包含 layers_sim 和 status 列
+                        df.to_csv(output_file, columns=['layers_sim', 'status'], index=False)
+                            
+                        print(f"Results for {data_item}{i} saved to {output_file}, num of sentences:", n_sentences)
 
 
     # 填充all_hidden_array
@@ -502,107 +816,167 @@ class Classifier:
     
         return padded_arrays
     
+    
+    def train_pred(self, args: ClassifierArgs):
+        for attack in args.attack_list:
+            # 读取训练集和测试集
+            train_df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/all_train.csv')  # 替换为你的训练集文件路径
+            test_df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/all_test.csv')  # 替换为你的测试集文件路径
 
-    def train_sim0(self, args: ClassifierArgs):
-        # 读取 CSV 文件
-        try:
-            df = pd.read_csv('/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/sst2/sentence_layer_sim/bert_if_fine_tuning/all_train.csv')
-        except FileNotFoundError:
-            print("Error: The file was not found.")
-            return
+            # 将 layers_pre 列中的字符串转换为列表
+            train_df['layers_pre'] = train_df['layers_pre'].apply(ast.literal_eval)
+            test_df['layers_pre'] = test_df['layers_pre'].apply(ast.literal_eval)
 
-        # 打印原始数据
-        print("Original DataFrame:")
-        print(df.head())
+            # 提取特征和标签
+            X_train = np.array(train_df['layers_pre'].tolist())  # 训练特征
+            y_train = train_df['status'].values  # 训练标签
 
-        # 将 layers_sim 列中的字符串转换为列表
-        df['layers_sim'] = df['layers_sim'].apply(ast.literal_eval)
+            X_test = np.array(test_df['layers_pre'].tolist())  # 测试特征
+            y_test = test_df['status'].values  # 测试标签
 
-        # 提取特征和标签
-        X = np.array(df['layers_sim'].tolist())  # 特征：layers_sim 列
-        y = df['status'].values  # 标签：status 列
+            # 训练模型
+            self.classifier.fit(X_train, y_train)
 
-        # 划分训练集和测试集
-        X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
-
-        # 特征标准化
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train)
-        X_test = scaler.transform(X_test)
-
-        # 选择分类器，这里以随机森林为例
-        classifier = LogisticRegression(random_state=42)
-
-        # 训练模型
-        classifier.fit(X_train, y_train)
-
+            # 预测
+            y_pred = self.classifier.predict(X_test)
+            
+            # 保存模型
+            joblib.dump(self.classifier, f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/save_models/{args.dataset_name}_bert/pred_models/{attack}/{args.classifier}.pkl')
+            print(f"Model trained and saved as {args.classifier}.pkl")
+            
+            self.evaluate_pred(args, attack, is_training=True)
         
-        # 保存模型
-        joblib.dump(classifier, '/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/save_models/sst2_bert/sim_models/random_forest_model1.pkl')
-        print("Model trained and saved as random_forest_model.pkl")
-       
-        # 预测
-        y_pred = classifier.predict(X_test)
-
-        # 评估模型
-        print("Accuracy:", accuracy_score(y_test, y_pred))
-        print(classification_report(y_test, y_pred))
-
-        # 预测新数据示例
-        new_layers_sim = [[0.9982, 0.9766, 0.9409, 0.8758, 0.8359, 0.8157, 0.7864, 0.7004, 0.6383, 0.5599, 0.4316, 0.3738]]
-        new_layers_sim = scaler.transform(new_layers_sim)  # 标准化新数据
-        prediction = classifier.predict(new_layers_sim)
-        print("Predicted Status for new data:", prediction)
-
-
-
-    def train_sim(self, args: ClassifierArgs):
-        # 读取 CSV 文件
-        df = pd.read_csv('/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/sst2/sentence_layer_sim/bert_if_fine_tuning/all_train.csv')
-
-        # 将 layers_sim 列中的字符串转换为列表
-        df['layers_sim'] = df['layers_sim'].apply(ast.literal_eval)
-
-        # 提取特征和标签
-        X = np.array(df['layers_sim'].tolist())  # 特征：layers_sim 列
-        y = df['status'].values  # 标签：status 列
-
-        # 训练模型，使用整个train数据集
-        self.classifier_sim.fit(X, y)
         
-        # 保存模型
-        joblib.dump(self.classifier_sim, '/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/save_models/sst2_bert/sim_models/random_forest_model_SVM.pkl')
-        print("Model trained and saved as random_forest_model.pkl")
-        
-        self.evaluate_sim(args, is_training=True)
-
-
-
-    def evaluate_sim(self, args: ClassifierArgs, is_training = False):
+    def evaluate_pred(self, args: ClassifierArgs, attack, is_training = False):
         if is_training:
             print('Using current modeling parameter to evaluate')
         else:
             # 加载模型
-            self.classifier_sim = joblib.load('/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/save_models/sst2_bert/sim_models/random_forest_model_MLP.pkl')
+            self.classifier = joblib.load(f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/save_models/{args.dataset_name}_bert/pred_models/{attack}/{args.classifier}.pkl')
             print("load model from file.")
             
         # 读取 CSV 文件
-        df = pd.read_csv('/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/sst2/sentence_layer_sim/bert_if_fine_tuning/all_test.csv')
+        df = pd.read_csv(f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/{args.dataset_name}/sentence_layer_probility/{attack}/all_test.csv')
 
         # 将 layers_sim 列中的字符串转换为列表
-        df['layers_sim'] = df['layers_sim'].apply(ast.literal_eval)
+        df['layers_pre'] = df['layers_pre'].apply(ast.literal_eval)
 
         # 提取特征和标签
-        X = np.array(df['layers_sim'].tolist())  # 特征：layers_sim 列
+        X = np.array(df['layers_pre'].tolist())  # 特征：layers_sim 列
         y = df['status'].values  # 标签：status 列
 
         # 预测
-        y_pred = self.classifier_sim.predict(X)  # 直接使用整个特征集进行预测
+        y_pred = self.classifier.predict(X)  # 直接使用整个特征集进行预测
 
         # 评估模型
         print("Accuracy:", accuracy_score(y, y_pred))
         print(classification_report(y, y_pred))
 
+    
+
+    def train_sim(self, args: ClassifierArgs):
+        for attack in args.attack_list:
+            print(f"attack: {attack}")
+            # 读取 CSV 文件
+            df = pd.read_csv(f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/{args.dataset_name}/sentence_layer_sim/bert_if_fine_tuning/{attack}/all_train.csv')
+
+            # 将 layers_sim 列中的字符串转换为列表
+            df['layers_sim'] = df['layers_sim'].apply(ast.literal_eval)
+
+            # 提取特征和标签,前三个
+            X = np.array([np.array(layer[-4:]).astype(float) for layer in df['layers_sim']])
+            # X = np.array(df['layers_sim'].tolist())  # 特征：layers_sim 列
+            y = df['status'].values  # 标签：status 列
+
+            # 训练模型，使用整个train数据集
+            self.classifier.fit(X, y)
+            
+            # 保存模型
+            joblib.dump(self.classifier, f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/save_models/{args.dataset_name}_bert/sim_models/{attack}/0-3/{args.classifier}.pkl')
+            print(f"Model trained and saved as {args.classifier}.pkl")
+            
+            self.evaluate_sim(args, attack, is_training=True)
+
+
+
+    def evaluate_sim(self, args: ClassifierArgs, attack, is_training = False):
+        if is_training:
+            print('Using current modeling parameter to evaluate')
+        else:
+            # 加载模型
+            self.classifier = joblib.load(f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/save_models/{args.dataset_name}_bert/sim_models/{attack}/0-3/{args.classifier}.pkl')
+            print("load model from file.")
+            
+        # 读取 CSV 文件
+        df = pd.read_csv(f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/{args.dataset_name}/sentence_layer_sim/bert_if_fine_tuning/{attack}/all_test.csv')
+
+        # 假设 df 是你的 DataFrame
+        
+        nan_rows = df[df['layers_sim'].isna()]
+        # 输出这些行
+        print(nan_rows)
+        # 检查 'layers_sim' 列中的值是否为 nan，如果是，则替换为一个有效的字面量结构，比如空列表 []
+        # df['layers_sim'] = df['layers_sim'].apply(lambda x: ast.literal_eval(x) if pd.notnull(x) else [])
+        # 将 layers_sim 列中的字符串转换为列表
+        df['layers_sim'] = df['layers_sim'].apply(ast.literal_eval)
+
+        # 提取特征和标签
+        X = np.array([np.array(layer[-4:]).astype(float) for layer in df['layers_sim']])
+
+        # X = np.array(df['layers_sim'].tolist())  # 特征：layers_sim 列
+        y = df['status'].values  # 标签：status 列
+
+        # 预测
+        y_pred = self.classifier.predict(X)  # 直接使用整个特征集进行预测
+        
+        
+        # 评估模型
+        print("Accuracy:", accuracy_score(y, y_pred))
+        print(classification_report(y, y_pred))
+    
+    # 将攻击后的train和test数据的attack_results.csv文件，分别取出att_test.txt、org_test.txt、att_train.txt、org_train.txt
+    def attack_csv_to_txt(self, args: ClassifierArgs):
+        # data_type依次取['train', 'test']
+        for attack in args.attack_list:
+            for data_type in args.attacked_data_type:
+                # 读取 CSV 文件,一个test.csv文件生成两个txt文件，分别保存perturbed_text/original_text和 ground_truth_output
+                csv_file = f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/result_log/{args.dataset_name}_bert/attack-len256-epo10-batch32/{attack}/{data_type}/attack_results.csv'  # 替换为你的 CSV 文件路径
+                df = pd.read_csv(csv_file)
+
+                # 筛选出 result_type 为 "Successful" 的行
+                successful_attacks = df[df['result_type'] == 'Successful']
+
+                # 分别取出perturbed_text和original_text
+                text_names = ['original_text', 'perturbed_text']
+
+                for text_name in text_names:
+                    # 提取 perturbed_text/original_text和 ground_truth_output 列 
+                    get_texts = successful_attacks[text_name].astype(str)
+                    ground_truth_outputs = successful_attacks['ground_truth_output'].astype(int)
+
+                    if text_name == 'original_text':
+                        # 将结果保存到 TXT 文件中
+                        txt_file = f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/{args.dataset_name}/att_data/{attack}/org_{data_type}.txt'  # 输出的 TXT 文件路径
+
+                        with open(txt_file, 'w') as f:
+                            for text, output in zip(get_texts, ground_truth_outputs):
+                                # 删除 perturbed_text 中的 '[[', ']]'
+                                text = text.replace('[[', '').replace(']]', '')
+                                f.write(f"{text}\t{output}\n")
+                            print(f"Successfully saved {data_type} {text_name} and ground_truth_output to {txt_file}")
+                    else:
+                        txt_file = f'/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/{args.dataset_name}/att_data/{attack}/att_{data_type}.txt'  # 输出的 TXT 文件路径
+
+                        with open(txt_file, 'w') as f:
+                            for text, output in zip(get_texts, ground_truth_outputs):
+                                # 删除 perturbed_text 中的 '[[', ']]'
+                                text = text.replace('[[', '').replace(']]', '')
+                                f.write(f"{text}\t{output}\n")
+                            print(f"Successfully saved {data_type} {text_name} and ground_truth_output to {txt_file}")
+            args.evaluation_data_type = 'train'
+            self.evaluate_if_succ(args)
+            args.evaluation_data_type = 'test'
+            self.evaluate_if_succ(args)
         
     @torch.no_grad()
     def infer(self, args: ClassifierArgs) -> Dict:
@@ -900,6 +1274,11 @@ class Classifier:
         else:
             return mask_instance(instance, args.sparse_mask_rate, self.tokenizer.mask_token, numbers, return_indexes)
 
+    def sim(self, args: ClassifierArgs):
+        self.attack_csv_to_txt()
+        self.output_hidden()
+        self.output_sim
+        
 
     @classmethod
     def run(cls, args: ClassifierArgs):
