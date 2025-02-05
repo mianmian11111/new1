@@ -356,7 +356,7 @@ class Classifier:
         logging.info(metric)
         return metric
     
-    # 取出att_test攻击成功里能该表标签的数据
+    # 取出att_test攻击成功的数据
     @torch.no_grad()
     def evaluate_if_succ(self, args: ClassifierArgs, is_training=False):
         for attack in args.attack_list:
