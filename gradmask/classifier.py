@@ -355,126 +355,6 @@ class Classifier:
         print(metric)
         logging.info(metric)
         return metric
-    
-    # 取出att_test攻击成功的数据
-    @torch.no_grad()
-    def evaluate_if_succ(self, args: ClassifierArgs, is_training=False):
-        for attack in args.attack_list:
-            if is_training:
-                logging.info('Using current modeling parameter to evaluate')
-                # data_type = 'dev'
-            else:
-                if args.parameter_fine_tuning:
-                    self.loading_model_from_file(args.saving_dir, args.build_saving_file_name(description=f'best-{args.tag}'))
-                # data_type = args.evaluation_data_type
-            for data_type in args.attacked_data_type:
-                org_data_dir = f'att_data/{attack}/org_{data_type}'
-                self.model.eval()
-                # 评估攻击前的数据
-                dataset_org, data_loader_org = self.build_data_loader(args, org_data_dir)
-                epoch_iterator_org = tqdm(data_loader_org)
-
-                # 保存攻击前的预测结果
-                predictions_org = []
-                metric_org = DATASET_TYPE.get_evaluation_metric(args.dataset_name, compare_key=args.compare_key)
-
-                for step, batch in enumerate(epoch_iterator_org):
-                    assert isinstance(batch[0], torch.Tensor)
-                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    batch = tuple(t.to(device) for t in batch)
-                    golds = batch[3]
-                    inputs = convert_batch_to_bert_input_dict(batch, args.model_type)
-                    
-                    outputs = self.model.forward(**inputs)
-                    logits = outputs.logits
-
-                    # 获取攻击前的预测结果
-                    predictions = torch.argmax(logits, dim=-1)
-                    predictions_org.extend(predictions.cpu().numpy())
-                    losses = self.loss_function(logits.view(-1, self.data_reader.NUM_LABELS), golds.view(-1))
-                    metric_org(losses, logits, golds)
-
-                # 评估攻击后的数据
-                att_data_dir = f'att_data/{attack}/att_{data_type}'
-                dataset_att, data_loader_att = self.build_data_loader(args, att_data_dir)
-                epoch_iterator_att = tqdm(data_loader_att)
-                
-                # 保存攻击后的预测结果
-                predictions_att = []
-                metric_att = DATASET_TYPE.get_evaluation_metric(args.dataset_name, compare_key=args.compare_key)
-
-
-                for step, batch in enumerate(epoch_iterator_att):
-                    assert isinstance(batch[0], torch.Tensor)
-                    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-                    batch = tuple(t.to(device) for t in batch)
-                    golds = batch[3]
-                    inputs = convert_batch_to_bert_input_dict(batch, args.model_type)
-                    
-                    outputs = self.model.forward(**inputs)
-                    logits = outputs.logits
-
-                    # 获取攻击后的预测结果
-                    predictions = torch.argmax(logits, dim=-1)
-                    predictions_att.extend(predictions.cpu().numpy())
-                    losses = self.loss_function(logits.view(-1, self.data_reader.NUM_LABELS), golds.view(-1))
-                    metric_att(losses, logits, golds)
-
-                # 生成掩码，表示攻击前后预测结果是否不同,攻击前后预测结果不同则为True
-                mask = (np.array(predictions_org) != np.array(predictions_att))
-
-                # 将 mask 转换为 tensor
-                filtered_mask = torch.tensor(mask)
-
-                # 计算 True 的概率
-                true_count = filtered_mask.sum().item()
-                total_count = filtered_mask.size(0)
-
-                # 计算 True 的概率
-                true_probability = true_count / total_count if total_count > 0 else 0.0
-
-                # 打印或记录 mask
-                print("Mask (True indicates prediction changed):", filtered_mask)
-                print(f"Probability of True in mask: {true_probability:.4f}")
-                
-                # 读取 test.txt 文件被攻击后的数据，evaluation_data_type是test
-                with open(f'dataset/{args.dataset_name}/{att_data_dir}.txt', 'r') as att_file:
-                    att_data = att_file.readlines()  # 读取所有行
-                with open(f'dataset/{args.dataset_name}/{org_data_dir}.txt', 'r') as org_file:
-                    org_data = org_file.readlines()
-
-                # 确保 combined_mask 和数据集长度匹配
-                assert len(filtered_mask) == len(att_data), "combined_mask length must match the length of the dataset."
-
-                # 使用 combined_mask 筛选出攻击不成功的数据
-                # combined_mask 为 True 表示攻击成功，反之为失败，保留combined_mask为True的数据
-                filtered_att_data = [att_data[i] for i in range(len(filtered_mask)) if filtered_mask[i]]
-                filtered_org_data = [org_data[i] for i in range(len(filtered_mask)) if filtered_mask[i]]
-
-                att_data_succ = f'dataset/{args.dataset_name}/att_data/{attack}/att_{data_type}_succ.txt'
-                org_data_succ = f'dataset/{args.dataset_name}/att_data/{attack}/org_{data_type}_succ.txt'
-                # 将过滤后的扰动数据保存到新的文件
-                with open(att_data_succ, 'w') as file:
-                    file.writelines(filtered_att_data)
-                print(f"att Filtered data saved to {att_data_succ}, total {len(att_data)} samples,save {len(filtered_att_data)}")
-
-                # 将过滤后的原始数据保存到新的文件
-                with open(org_data_succ, 'w') as file:
-                    file.writelines(filtered_org_data)
-                print(f"org Filtered data saved to {org_data_succ}, total {len(att_data)} samples,save {len(filtered_att_data)}")
-
-                args.evaluation_data_type = f'att_data/{attack}/att_{data_type}_succ'
-                metric_att_succ = self.evaluate(args)
-                args.evaluation_data_type = f'att_data/{attack}/org_{data_type}_succ'
-                metric_org_succ = self.evaluate(args)
-                
-
-                tag = args.evaluation_data_type
-                print(f'{tag}_att:', metric_att)
-                print(f'{tag}_org:', metric_org)
-                print(f'succ_{tag}_att:', metric_att_succ)
-                print(f'succ_{tag}_org:', metric_org_succ)
-        return filtered_mask  # 返回 metric 和 mask
         
     @torch.no_grad()
     def output_pred(self, args: ClassifierArgs, is_training=False) -> Metric:
@@ -973,10 +853,10 @@ class Classifier:
                                 text = text.replace('[[', '').replace(']]', '')
                                 f.write(f"{text}\t{output}\n")
                             print(f"Successfully saved {data_type} {text_name} and ground_truth_output to {txt_file}")
-            args.evaluation_data_type = 'train'
-            self.evaluate_if_succ(args)
-            args.evaluation_data_type = 'test'
-            self.evaluate_if_succ(args)
+            #args.evaluation_data_type = 'train'
+            #self.evaluate_if_succ(args)
+            #args.evaluation_data_type = 'test'
+            #self.evaluate_if_succ(args)
         
     @torch.no_grad()
     def infer(self, args: ClassifierArgs) -> Dict:
