@@ -1280,10 +1280,10 @@ class Classifier:
                                 text = text.replace('[[', '').replace(']]', '')
                                 f.write(f"{text}\t{output}\n")
                             print(f"Successfully saved {data_type} {text_name} and ground_truth_output to {txt_file}")
-            args.evaluation_data_type = 'train'
-            self.evaluate_if_succ(args)
-            args.evaluation_data_type = 'test'
-            self.evaluate_if_succ(args)
+            # args.evaluation_data_type = 'train'
+            # self.evaluate_if_succ(args)
+            # args.evaluation_data_type = 'test'
+            # self.evaluate_if_succ(args)
         
     @torch.no_grad()
     def infer(self, args: ClassifierArgs) -> Dict:
