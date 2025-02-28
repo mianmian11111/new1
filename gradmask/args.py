@@ -21,7 +21,7 @@ class ClassifierArgs(ProgramArgs):
         self.attack_data_type = 'test'
         self.attack = 'textbugger'
         self.attack_list = ['textbugger','textfooler','deepwordbug']
-        self.sim_f = 'cosine_similarity'
+        self.sim_f = ['cosine_similarity','点积','欧式距离','皮尔逊相关系数','曼哈顿距离']
         self.layer_list = [0,1,2,3,4,5,6,7,8,9,10,11]
         #self.hidden_data_type = ['org_test','att_test','org_train','att_train'] 
         self.hidden_data_type = ['org_test','att_test','org_train','org_train'] 
