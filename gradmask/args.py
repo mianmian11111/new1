@@ -17,18 +17,27 @@ class ClassifierArgs(ProgramArgs):
 
         self.seed = 42    # for seed of all random function(including, np.random, random, torch, so on.)
         self.evaluation_data_type = 'test'  # default is 'test', meaning using test set to evaluate
-        self.attacked_data_type = 'att'
+        self.attacked_data_type = ['train', 'test']
         self.attack_data_type = 'test'
-        self.hidden_data_type = 'att'
+        self.attack = 'textbugger'
+        self.attack_list = ['textbugger','textfooler','deepwordbug']
+        self.sim_f = 'cosine_similarity'
+        self.layer_list = [0,1,2,3,4,5,6,7,8,9,10,11]
+        #self.hidden_data_type = ['org_test','att_test','org_train','att_train'] 
+        self.hidden_data_type = ['org_test','att_test','org_train','org_train'] 
+        self.data_rate = 1
+
+
 	    # 表示best_model的后缀，代表当前是哪个模型
         self.tag = 12
         self.layer = 12
         # 是否使用微调后的模型参数
         self.parameter_fine_tuning = True
+        self.classifier = 'MLP'
+        self.pred_data_type = ['att_test_succ','att_train_succ','org_test_succ','org_train_succ']
+        
 
-
-
-        self.dataset_name = 'sst2'
+        self.dataset_name = 'yelp'
         self.dataset_dir = '/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset'
         self.model_type = 'bert'
         self.model_name_or_path = '/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/bert-model/bert-base-uncased'
@@ -38,11 +47,11 @@ class ClassifierArgs(ProgramArgs):
         # self.model_name_or_path = 'roberta-base'
         self.k_nums=1
 
-        self.max_seq_length = 128       # the maximum length of input text to be truncated, for imdb, recommends 256; else, 128
+        self.max_seq_length = 256       # the maximum length of input text to be truncated, for imdb, recommends 256; else, 128
         self.do_lower_case = True
 
         self.epochs = 10  # training epochs
-        self.batch_size = 32  # batch size defaut:32
+        self.batch_size = 64# batch size defaut:32
         self.gradient_accumulation_steps = 1  # Number of updates steps to accumulate before performing a backward/update pass.
         self.learning_rate = 5e-5  # The initial learning rate for Adam.
         self.weight_decay = 1e-6  # weight decay
@@ -112,7 +121,7 @@ class ClassifierArgs(ProgramArgs):
         self.incremental_trick = False
         self.initial_mask_rate = 0.4
         self.saving_last_epoch = False
-        self.train='/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/sst2/train_cp.tsv'
+        self.train='/share/home/u2315363122/MI4D/mi4d-j/mi4d-j/gradmask/dataset/yelp/train_cp.tsv'
         self.dicct=self.cp()
         self.nums=0
         
