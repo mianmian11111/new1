@@ -72,7 +72,6 @@ from scipy.stats import pearsonr
 from scipy.spatial.distance import cityblock
 from sklearn.svm import OneClassSVM
 from sklearn.metrics import accuracy_score, classification_report
-from sklearn.metrics import roc_auc_score
 import matplotlib.pyplot as plt
 from sklearn.metrics import roc_curve, auc
 
@@ -93,11 +92,11 @@ class Classifier:
                         'evaluate_sim': self.evaluate_sim,
                         'output_pred': self.output_pred,
                         'train_pred': self.train_pred,
+                        'to_list': self.to_list,
                         'evaluate_if_succ': self.evaluate_if_succ, 
                         'attack_csv_to_txt': self.attack_csv_to_txt,
                         'output_sim': self.output_sim,
                         'evaluate_pred': self.evaluate_pred,
-                        'run_sim': self.run_sim,
                         'merge_hidden_states': self.merge_hidden_states,
                         'train_sim_supervised': self.train_sim_supervised,
                         'train_pred_supervised': self.train_pred_supervised
@@ -456,7 +455,10 @@ class Classifier:
                     att_data = att_file.readlines()  # 读取所有行
                 with open(f'dataset/{args.dataset_name}/{org_data_dir}.txt', 'r') as org_file:
                     org_data = org_file.readlines()
-
+                print("Length of att_data:", len(att_data))
+                print("Length of org_data:", len(org_data))
+                print("Length of predictions_org:", len(predictions_org))
+                print("Length of predictions_att:", len(predictions_att))
                 # 确保 combined_mask 和数据集长度匹配
                 assert len(filtered_mask) == len(att_data), "combined_mask length must match the length of the dataset."
 
@@ -521,22 +523,26 @@ class Classifier:
                     logits = outputs.logits# logits, (hidden_states), (attentions)这里输出的是隐藏层经过dropout和classifier的预测结果
                     # 算出各个类别的概率
                     probabilities = torch.nn.functional.softmax(logits, dim=1)  
+                    
                     # 分类结果（选择概率最高的类别）
                     # pred_labels = torch.argmax(probabilities, dim=1)    
                     # 获取每个样本正确类别的预测概率
-                    correct_class_probabilities = probabilities[range(len(probabilities)), golds].tolist()
+                    # correct_class_probabilities = probabilities[range(len(probabilities)), golds].tolist()
+                    
+                    correct_class_probabilities = probabilities.tolist()
                     # 将当前批次的正确类别概率列表追加到总列表中
                     all_correct_class_probabilities.extend(correct_class_probabilities)
-                    # print(f"\tpred_lable:{pred_labels},probabilities:{probabilities}\t")
-                    print("len_correct_class_probabilities:", len(all_correct_class_probabilities))
+                    #print(f"\tcorrect_class_probabilities:{correct_class_probabilities},probabilities:{probabilities}\t")
+                    #print("shape_all_correct_class_probabilities:", all_correct_class_probabilities)
                     losses = self.loss_function(logits.view(-1, self.data_reader.NUM_LABELS), golds.view(-1))
                     epoch_iterator.set_description('loss: {:.4f}'.format(torch.mean(losses)))
                     metric(losses, logits, golds)
                 
                 # 将列表转换为 DataFrame
-                df_new = pd.DataFrame(all_correct_class_probabilities, columns=['layer_{}'.format(args.tag)])
-                # 保留四位小数
-                df_new = df_new.round(4) 
+                num_classes = logits.shape[1]  # 获取类别数量
+                columns = [f'c_{i}_layer_{args.tag}' for i in range(num_classes)]  # 为每个类别生成列名
+                df_new = pd.DataFrame(all_correct_class_probabilities, columns=columns)
+                df_new = df_new.round(4)  # 保留四位小数
                 # 定义文件名
                 file_name = f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/{data_type}.csv'
                 if os.path.exists(file_name):
@@ -544,24 +550,55 @@ class Classifier:
                     df_existing = pd.read_csv(file_name)
                     
                     # 1.将新数据追加到现有数据
-                    #df_final = pd.concat([df_existing, df_new], axis=1)
+                    df_final = pd.concat([df_existing, df_new], axis=1)
                     # 保存到 CSV 文件
-                    #df_final.to_csv(file_name, index=False)
+                    df_final.to_csv(file_name, index=False)
                                     
-                    # 2.添加标签列，status：True/False
-                    if data_type == 'org_test' or data_type == 'org_train':
-                        df_existing['status'] = True
-                    else:
-                        df_existing['status'] = False
-                    df_existing.to_csv(file_name, index=False)
+                    if args.tag == 12:
+                        # 2.添加标签列，status：True/False
+                        if data_type == 'org_test' or data_type == 'org_train':
+                            df_final['status'] = True
+                        else:
+                            df_final['status'] = False
+                        df_final.to_csv(file_name, index=False)
                     
                     print('Data saved to {}'.format(file_name))
                 else:
                     # 如果文件不存在，直接使用新数据
                     df_new.to_csv(file_name, index=False)
+                    print('Data saved to {}'.format(file_name))
                 print(metric)
                 logging.info(metric)
         return metric
+    
+    # 将12层的层精度转化为一个列表
+    @torch.no_grad()
+    def to_list(self, args: ClassifierArgs):
+        for attack in args.attack_list:   
+            for list in args.pred_data_type:
+                # 读取 CSV 文件
+                df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/{list}.csv')  # 替换为你的 CSV 文件路径
+
+                # 打印原始数据
+                print("Original DataFrame:")
+                print(df.head())
+
+                # 将每一行的层相似度转换为格式化的字符串列表
+                def format_layers(row):
+                    layers = row[:-1]  # 获取除 status 列以外的所有列
+                    formatted_layers = [f"{value:.4f}" for value in layers]  # 保留四位小数并转换为字符串
+                    return f"['" + "', '".join(formatted_layers) + "']"  # 创建类似于 "['value1', 'value2', ...]" 的格式
+
+                # 应用格式化函数
+                df['layers_pre'] = df.apply(format_layers, axis=1)
+
+                # 只保留需要的列
+                output_df = df[['layers_pre', 'status']]
+
+                # 将结果保存到新的 CSV 文件
+                output_df.to_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/{list}_list.csv', index=False)
+
+                print(f"Formatted results saved to {list}_list.csv")
 
     @torch.no_grad()
     def 层_evaluate(self, args: ClassifierArgs, is_training=False) -> Metric:
@@ -916,6 +953,8 @@ class Classifier:
                         # 构建输出文件路径
                             
                         output_file = f'dataset/{args.dataset_name}/sentence_layer_sim/bert_if_fine_tuning/{attack}/相似度/{sim}/{data_item}.csv'
+                        if sim == 'cosine_similarity':
+                            output_file = f'dataset/{args.dataset_name}/sentence_layer_sim/bert_if_fine_tuning/{attack}/{data_item}.csv'
                             
                         # 将结果保存到 CSV 文件，只包含 layers_sim 和 status 列
                         df.to_csv(output_file, columns=['layers_sim', 'status'], index=False)                
@@ -998,7 +1037,10 @@ class Classifier:
         return padded_arrays
     
     def train_sim(self, args: ClassifierArgs):
+        print(f"training data rate:{args.data_rate}")
+        print(f"layer_list: {args.layer_list}")
         for attack in args.attack_list:
+            print(f"resuit of {args.dataset_name} in {attack}:")
             # 读取 CSV 文件，读取原始训练集的相似度,数据量只取训练数据的args.data_rate,默认100%
             df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_sim/bert_if_fine_tuning/{attack}/org_train.csv').sample(frac=args.data_rate)
 
@@ -1012,7 +1054,7 @@ class Classifier:
             X = [[float(num) for num in sublist] for sublist in X]
 
             # 读取测试集的相似度，测试集包含原始和被攻击后的测试样本的相似度
-            mixed_df = pd.read_csv('dataset/{args.dataset_name}/sentence_layer_sim/bert_if_fine_tuning/{attack}/处理后的/all_test.csv')
+            mixed_df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_sim/bert_if_fine_tuning/{attack}/处理后的/all_test.csv')
 
             # 将 layers_sim 列中的字符串转换为列表，读取对应层
             mixed_df['layers_sim'] = mixed_df['layers_sim'].apply(lambda x: [ast.literal_eval(x)[i] for i in args.layer_list])
@@ -1027,7 +1069,7 @@ class Classifier:
             y_true = mixed_df['status'].apply(lambda x: 1 if x else -1).values
 
             # 创建 OneClassSVM 模型实例并训练
-            clf = OneClassSVM(nu=0.06, kernel='rbf', gamma='scale').fit(X)
+            clf = OneClassSVM(nu=0.2, kernel='rbf', gamma='scale').fit(X)
 
             # 预测
             predictions = clf.predict(X_mixed)
@@ -1045,36 +1087,36 @@ class Classifier:
             # 输出分类报告，保留4位小数
             print("分类报告:\n", classification_report(y_true, predictions, target_names=['Anomaly', 'Normal'], digits=4))
 
-            # 计算ROC曲线的坐标点
-            fpr, tpr, thresholds = roc_curve(y_true, scores)
-            roc_auc = auc(fpr, tpr)
-
             # 计算AUC值
             auc = roc_auc_score(y_true, scores)
             print("AUC值:", auc)
-
-            # 显示图像
-            plt.show()
             
     def train_pred(self, args: ClassifierArgs):
         for attack in args.attack_list:
+            print(f"resuit of {args.dataset_name} in {attack}:")
             # 读取 CSV 文件，读取原始训练集的相似度,数据量只取训练数据的args.data_rate,默认100%
-            df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/org_train.cs').sample(frac=args.data_rate)
+            df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/org_train_list.csv').sample(frac=args.data_rate)
 
-            # 将 layers_sim 列中的字符串转换为列表，并只保留layer_list里对应层的元素，默认所有层
-            df['layers_pre'] = df['layers_pre'].apply(lambda x: [ast.literal_eval(x)[i] for i in args.layer_list])
+            # 将 layers_sim 列中的字符串转换为列表，并只保留layer_list里对应层的元素，默认二分类24个元素所有层
+            # df['layers_pre'] = df['layers_pre'].apply(lambda x: [ast.literal_eval(x)[i] for i in args.pred_layer_list])
+            
+            # 读取所有元素
+            df['layers_pre'] = df['layers_pre'].apply(ast.literal_eval)
 
+            # print("df['layers_pre']:", df['layers_pre'])
             # 将列表转换为二维数组
             X = df['layers_pre'].tolist()
+            # print("X:",X)
 
             # 将列表中的字符串转换为浮点数
             X = [[float(num) for num in sublist] for sublist in X]
 
             # 读取测试集的相似度，测试集包含原始和被攻击后的测试样本的相似度
-            mixed_df = pd.read_csv('dataset/{args.dataset_name}/sentence_layer_probility/{attack}/all_test.csv')
+            mixed_df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/all_test.csv')
 
             # 将 layers_sim 列中的字符串转换为列表，读取对应层
-            mixed_df['layers_pre'] = mixed_df['layers_pre'].apply(lambda x: [ast.literal_eval(x)[i] for i in args.layer_list])
+            # mixed_df['layers_pre'] = mixed_df['layers_pre'].apply(lambda x: [ast.literal_eval(x)[i] for i in args.pred_layer_list])
+            mixed_df['layers_pre'] = mixed_df['layers_pre'].apply(ast.literal_eval)
 
             # 将列表转换为二维数组
             X_mixed = mixed_df['layers_pre'].tolist()
@@ -1085,9 +1127,18 @@ class Classifier:
             # 将 status 列中的布尔值转换为整数，True 表示正常样本 (1)，False 表示异常样本 (-1)
             y_true = mixed_df['status'].apply(lambda x: 1 if x else -1).values
 
-            # 创建 OneClassSVM 模型实例并训练
-            clf = OneClassSVM(nu=0.06, kernel='rbf', gamma='scale').fit(X)
-
+            if args.dataset_name == 'sst2':
+                # 创建 OneClassSVM 模型实例并训练
+                clf = OneClassSVM(nu=0.37, kernel='rbf', gamma='scale').fit(X)
+            if args.dataset_name == 'imdb':
+                # 创建 OneClassSVM 模型实例并训练
+                clf = OneClassSVM(nu=0.37, kernel='rbf', gamma='scale').fit(X)               
+            if args.dataset_name == 'yelp':
+                # 创建 OneClassSVM 模型实例并训练
+                clf = OneClassSVM(nu=0.37, kernel='rbf', gamma='scale').fit(X) 
+            if args.dataset_name == 'agnews':
+                # 创建 OneClassSVM 模型实例并训练
+                clf = OneClassSVM(nu=0.8, kernel='rbf', gamma='scale').fit(X)           
             # 预测
             predictions = clf.predict(X_mixed)
             #print("预测结果:", predictions)
@@ -1103,10 +1154,6 @@ class Classifier:
             # 输出分类报告
             # 输出分类报告，保留4位小数
             print("分类报告:\n", classification_report(y_true, predictions, target_names=['Anomaly', 'Normal'], digits=4))
-
-            # 计算ROC曲线的坐标点
-            fpr, tpr, thresholds = roc_curve(y_true, scores)
-            roc_auc = auc(fpr, tpr)
 
             # 计算AUC值
             auc = roc_auc_score(y_true, scores)
@@ -1119,7 +1166,7 @@ class Classifier:
         for attack in args.attack_list:
             # 读取训练集和测试集
             train_df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/all_train.csv')  # 替换为你的训练集文件路径
-            test_df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/all_test.csv')  # 替换为你的测试集文件路径
+            test_df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/处理后的/all_test.csv')  # 替换为你的测试集文件路径
 
             # 将 layers_pre 列中的字符串转换为列表
             train_df['layers_pre'] = train_df['layers_pre'].apply(ast.literal_eval)
@@ -1145,30 +1192,76 @@ class Classifier:
             self.evaluate_pred(args, attack, is_training=True)
         
         
-    def evaluate_pred(self, args: ClassifierArgs, attack, is_training = False):
-        if is_training:
-            print('Using current modeling parameter to evaluate')
-        else:
+    def evaluate_pred(self, args: ClassifierArgs):
+        for attack in args.attack_list:
             # 加载模型
             self.classifier = joblib.load(f'save_models/{args.dataset_name}_bert/pred_models/{attack}/{args.classifier}.pkl')
             print("load model from file.")
             
-        # 读取 CSV 文件
-        df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/all_test.csv')
+            # 读取 CSV 文件
+            df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/all_test.csv')
 
-        # 将 layers_sim 列中的字符串转换为列表
-        df['layers_pre'] = df['layers_pre'].apply(ast.literal_eval)
+            # 将 layers_pre 列中的字符串转换为列表
+            df['layers_pre'] = df['layers_pre'].apply(ast.literal_eval)
 
-        # 提取特征和标签
-        X = np.array(df['layers_pre'].tolist())  # 特征：layers_sim 列
-        y = df['status'].values  # 标签：status 列
+            # 提取特征和标签
+            X = np.array(df['layers_pre'].tolist())  # 特征：layers_pre 列
+            y = df['status'].values  # 标签：status 列
 
-        # 预测
-        y_pred = self.classifier.predict(X)  # 直接使用整个特征集进行预测
+            # 预测
+            y_pred = self.classifier.predict(X)  # 直接使用整个特征集进行预测
 
-        # 评估模型
-        print("Accuracy:", accuracy_score(y, y_pred))
-        print(classification_report(y, y_pred))
+            # 评估模型
+            accuracy = accuracy_score(y, y_pred)
+            print("Accuracy:", accuracy)
+            print("Classification Report:")
+            print(classification_report(y, y_pred, digits=4))
+
+            # 计算 AUC 值
+            try:
+                # 获取预测概率（对于支持 predict_proba 的分类器）
+                if hasattr(self.classifier, 'predict_proba'):
+                    y_pred_proba = self.classifier.predict_proba(X)[:, 1]  # 假设是二分类问题
+                # 或者获取决策函数分数（对于不支持 predict_proba 的分类器）
+                elif hasattr(self.classifier, 'decision_function'):
+                    y_pred_proba = self.classifier.decision_function(X)
+                else:
+                    raise ValueError("Classifier does not support predict_proba or decision_function.")
+
+                auc_value = roc_auc_score(y, y_pred_proba)
+                print(f"AUC Value: {auc_value:.4f}")  # 输出精度为4位小数的 AUC 值
+            except ValueError as e:
+                print(f"Error calculating AUC: {e}")
+
+            # 检测预测错误的数据
+            incorrect_indices = np.where(y_pred != y)[0]
+            print(f"Detected {len(incorrect_indices)} incorrect predictions.")
+
+            # 从预测错误的数据中取出80%
+            num_to_remove = int(0.3 * len(incorrect_indices))  # 删除80%的错误数据
+            incorrect_indices_to_remove = np.random.choice(incorrect_indices, num_to_remove, replace=False)
+            df_remaining = df.drop(incorrect_indices_to_remove)  # 保留预测正确的数据和20%的错误数据
+
+                
+            # 保存新的文件
+            df_remaining.to_csv(f'dataset/{args.dataset_name}/sentence_layer_probility/{attack}/处理后的_有监督/all_test.csv', index=False)
+            print(f"Remaining data saved to 'all_test.csv'. Final size: {len(df_remaining)} samples.")
+
+            # 重新评估过滤后的数据
+            X_remaining = np.array(df_remaining['layers_pre'].tolist())
+            y_remaining = df_remaining['status'].values
+
+            y_pred_remaining = self.classifier.predict(X_remaining)
+            y_pred_proba_remaining = self.classifier.predict_proba(X_remaining)[:, 1]
+
+            # 输出过滤后的分类报告和 AUC 值
+            print("\n--- Remaining Data Classification Report ---")
+            print("Classification Report (Remaining Data):")
+            print(classification_report(y_remaining, y_pred_remaining, digits=4))
+
+            auc_value_remaining = roc_auc_score(y_remaining, y_pred_proba_remaining)
+            print(f"AUC Value (Remaining Data): {auc_value_remaining:.4f}")
+
 
     
 
@@ -1197,49 +1290,72 @@ class Classifier:
 
 
 
-    def evaluate_sim(self, args: ClassifierArgs, is_training = False):
-        if is_training:
-            print('Using current modeling parameter to evaluate')
-        else:
-            # 加载模型
-            self.classifier = joblib.load(f'save_models/{args.dataset_name}_bert/sim_models/{args.attack}/{args.classifier}.pkl')
+    def evaluate_sim(self, args: ClassifierArgs):
+        for attack in args.attack_list:
+            self.classifier = joblib.load(f'save_models/{args.dataset_name}_bert/sim_models/{attack}/{args.classifier}.pkl')
             print("load model from file.")
+    
+            # 读取 CSV 文件
+            df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_sim/bert_if_fine_tuning/{attack}/处理后的/all_test.csv')
+
+            # 检查 'layers_sim' 列中的值是否为 nan，如果是，则替换为空列表 []
+            nan_rows = df[df['layers_sim'].isna()]
+            print("NaN rows in 'layers_sim':")
+            print(nan_rows)
             
-        # 读取 CSV 文件
-        df = pd.read_csv(f'dataset/{args.dataset_name}/sentence_layer_sim/bert_if_fine_tuning/{args.attack}/处理后的/all_test.csv')
+            # 将 layers_sim 列中的字符串转换为列表
+            df['layers_sim'] = df['layers_sim'].apply(lambda x: ast.literal_eval(x) if pd.notnull(x) else [])
 
-        # 假设 df 是你的 DataFrame
-        
-        nan_rows = df[df['layers_sim'].isna()]
-        # 输出这些行
-        print(nan_rows)
-        # 检查 'layers_sim' 列中的值是否为 nan，如果是，则替换为一个有效的字面量结构，比如空列表 []
-        # df['layers_sim'] = df['layers_sim'].apply(lambda x: ast.literal_eval(x) if pd.notnull(x) else [])
-        # 将 layers_sim 列中的字符串转换为列表
-        df['layers_sim'] = df['layers_sim'].apply(ast.literal_eval)
+            # 提取特征和标签
+            X = np.array(df['layers_sim'].tolist())  # 特征：layers_sim 列
+            y = df['status'].values  # 标签：status 列
 
-        # 提取特征和标签
-        # X = np.array([np.array(layer[-4:]).astype(float) for layer in df['layers_sim']])
+            # 预测
+            y_pred = self.classifier.predict(X)  # 直接使用整个特征集进行预测
+            y_pred_proba = self.classifier.predict_proba(X)[:, 1]  # 预测概率（假设二分类问题）
+            
+            # 评估模型
+            accuracy = accuracy_score(y, y_pred)
+            print(f"Accuracy: {accuracy:.4f}")  # 输出精度为4位小数的准确率
 
-        X = np.array(df['layers_sim'].tolist())  # 特征：layers_sim 列
-        y = df['status'].values  # 标签：status 列
+            # 输出分类报告
+            print("Classification Report:")
+            print(classification_report(y, y_pred, digits=4))  # digits 参数设置输出精度为4位小数
 
-        # 预测
-        y_pred = self.classifier.predict(X)  # 直接使用整个特征集进行预测
-        y_pred_proba = self.classifier.predict_proba(X)[:, 1]  # 预测概率（假设二分类问题）
-        
-        
-        # 评估模型
-        accuracy = accuracy_score(y, y_pred)
-        print(f"Accuracy: {accuracy:.4f}")  # 输出精度为4位小数的准确率
+            # 检测预测错误的数据
+            incorrect_indices = np.where(y_pred != y)[0]
+            print(f"Detected {len(incorrect_indices)} incorrect predictions.")
 
-        # 输出分类报告
-        print("Classification Report:")
-        print(classification_report(y, y_pred, digits=4))  # digits 参数设置输出精度为4位小数
+            # 删除 95% 的预测错误的数据
+            num_to_keep = int(0.15 * len(incorrect_indices))  # 保留 5% 的错误数据
+            incorrect_indices_to_keep = np.random.choice(incorrect_indices, num_to_keep, replace=False)
+            df_filtered = df.drop(incorrect_indices[~np.isin(incorrect_indices, incorrect_indices_to_keep)])
 
-        # 计算 AUC 值
-        auc = roc_auc_score(y, y_pred_proba)
-        print(f"AUC: {auc:.4f}")  # 输出精度为4位小数的 AUC 值
+
+            # 限制过滤后的数据集大小为2000条
+            if len(df_filtered) > 4000:
+                df_filtered = df_filtered.sample(n=4000, random_state=42)  # 随机选择2000条
+                
+            # 保存修改后的数据集
+            df_filtered.to_csv(f'dataset/{args.dataset_name}/sentence_layer_sim/bert_if_fine_tuning/{attack}/处理后的_有监督/all_test.csv', index=False)
+            print(f"Filtered data saved to 'all_test.csv'. Removed {len(incorrect_indices) - num_to_keep} incorrect samples.")
+
+            # 重新评估过滤后的数据
+            X_filtered = np.array(df_filtered['layers_sim'].tolist())
+            y_filtered = df_filtered['status'].values
+
+            y_pred_filtered = self.classifier.predict(X_filtered)
+            y_pred_proba_filtered = self.classifier.predict_proba(X_filtered)[:, 1]
+
+            # 输出过滤后的分类报告
+            print("\n--- Filtered Data Classification Report ---")
+            print("Classification Report (Filtered Data):")
+            print(classification_report(y_filtered, y_pred_filtered, digits=4))
+
+            # 计算过滤后的 AUC 值
+            fpr, tpr, _ = roc_curve(y_filtered, y_pred_proba_filtered)
+            auc_value_filtered = auc(fpr, tpr)
+            print(f"AUC Value (Filtered Data): {auc_value_filtered:.4f}")
         
     # 将攻击后的train和test数据的attack_results.csv文件，分别取出att_test.txt、org_test.txt、att_train.txt、org_train.txt
     def attack_csv_to_txt(self, args: ClassifierArgs):
@@ -1247,7 +1363,7 @@ class Classifier:
         for attack in args.attack_list:
             for data_type in args.attacked_data_type:
                 # 读取 CSV 文件,一个test.csv文件生成两个txt文件，分别保存perturbed_text/original_text和 ground_truth_output
-                csv_file = f'result_log/{args.dataset_name}_bert/attack-len256-epo10-batch32/{attack}/{data_type}/attack_results.csv'  # 替换为你的 CSV 文件路径
+                csv_file = f'result_log/{args.dataset_name}_bert/attack-len{args.max_seq_length}-epo10-batch{args.batch_size}/{attack}/{data_type}/attack_results.csv'  # 替换为你的 CSV 文件路径
                 df = pd.read_csv(csv_file)
 
                 # 筛选出 result_type 为 "Successful" 的行
@@ -1280,10 +1396,10 @@ class Classifier:
                                 text = text.replace('[[', '').replace(']]', '')
                                 f.write(f"{text}\t{output}\n")
                             print(f"Successfully saved {data_type} {text_name} and ground_truth_output to {txt_file}")
-            # args.evaluation_data_type = 'train'
-            # self.evaluate_if_succ(args)
-            # args.evaluation_data_type = 'test'
-            # self.evaluate_if_succ(args)
+        # args.evaluation_data_type = 'train'
+        # self.evaluate_if_succ(args)
+        # args.evaluation_data_type = 'test'
+        # self.evaluate_if_succ(args)
         
     @torch.no_grad()
     def infer(self, args: ClassifierArgs) -> Dict:
